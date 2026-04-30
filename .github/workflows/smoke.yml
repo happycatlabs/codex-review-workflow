@@ -1,0 +1,8 @@
+name: Smoke (reusable)
+on:
+  workflow_call:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "smoke from central repo"
