@@ -50,9 +50,6 @@ on:
         description: 'Sentry auth token. Optional — only used when sentry-project is set.'
         required: false
 
-concurrency:
-  group: codex-structured-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
 
 jobs:
   codex-structured-review:
