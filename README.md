@@ -13,6 +13,17 @@ on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
 
+# Required. The reusable workflow needs pull-requests + issues write to
+# post the sticky review comment. GitHub enforces that a called
+# workflow's job-level permissions are bounded by the caller's
+# workflow-level permissions, so the caller must declare at least
+# these. Without it, GitHub refuses to start the run with a bare
+# `startup_failure` and no further detail.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
   review:
     uses: happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml@main
