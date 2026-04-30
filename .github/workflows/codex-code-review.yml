@@ -12,7 +12,7 @@ name: Codex Code Review (reusable)
 on:
   workflow_call:
     inputs:
-      runs-on:
+      runner:
         description: 'Runner label. Override to use a self-hosted or larger runner.'
         type: string
         required: false
@@ -58,7 +58,7 @@ jobs:
   codex-structured-review:
     name: Run Codex structured review
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
       pull-requests: write

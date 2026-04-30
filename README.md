@@ -33,7 +33,7 @@ All inputs have defaults; most consumers won't need to set any.
 
 | Input | Default | Purpose |
 |---|---|---|
-| `runs-on` | `ubuntu-latest` | Override for self-hosted or larger runners. |
+| `runner` | `ubuntu-latest` | Runner label. Override for self-hosted or larger runners. |
 | `model` | `gpt-5.5` | Codex model. Must be subscription-eligible. |
 | `codex-cli-version` | `0.124.0` | Pinned `@openai/codex` npm version. |
 | `sentry-project` | _(empty)_ | Sentry project slug. If unset, the Sentry-context step is skipped. |
