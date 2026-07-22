@@ -286,7 +286,8 @@ Delivery order is therefore:
 1. commit and review this reusable-workflow change;
 2. push it and record the immutable commit SHA;
 3. update the Fable caller to the exact trigger above, pin `uses:` to that SHA,
-   and pass the exact `allow-bot-users: dancer-automation[bot]` actor;
+   and pass the exact Dancer and Dependabot bot actors used to author reviewed
+   work and immutable-pin update PRs;
 4. run the live canaries below;
 5. only then consider the result as candidate merge authority.
 
