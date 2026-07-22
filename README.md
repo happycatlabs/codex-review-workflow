@@ -1,80 +1,83 @@
 # codex-review-workflow
 
-Centralized **Codex Code Review** reusable workflow for `happycatlabs/*` repos.
+Reusable exact-snapshot Codex review for `happycatlabs/*` pull requests.
 
-This repo owns the canonical `.github/workflows/codex-code-review.yml`. Each consumer repo has a thin caller that delegates here, so the prompt, auth model, incremental-review state, and comment lifecycle live in one place and update org-wide on push to `main`.
+The V1 workflow has four jobs:
 
-## Quick start (consumer repo)
+1. verify a base-controlled `pull_request_target` still targets the repository's
+   current default branch and that its live base is an ancestor of the PR head;
+2. prepare a bounded, strict UTF-8 `BASE..HEAD` diff packet with no secrets;
+3. run Codex with no source checkout and both execution tools disabled;
+4. refetch the PR snapshot, verify immutable workflow provenance, publish a
+   machine artifact and fresh comment, and fail closed unless the result is
+   clean.
 
-Add `.github/workflows/codex-code-review.yml`:
+## Consumer setup
+
+The caller must be base-controlled and pin the reusable workflow to one full
+40-character commit SHA.
 
 ```yaml
-on:
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
+name: Codex code review
 
-# Required. The reusable workflow needs pull-requests + issues write to
-# post the sticky review comment. GitHub enforces that a called
-# workflow's job-level permissions are bounded by the caller's
-# workflow-level permissions, so the caller must declare at least
-# these. Without it, GitHub refuses to start the run with a bare
-# `startup_failure` and no further detail.
+on:
+  pull_request_target:
+    branches: [master]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+
 permissions:
+  actions: read
   contents: read
   pull-requests: write
   issues: write
 
 jobs:
   review:
-    uses: happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml@main
+    uses: happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml@WORKFLOW_COMMIT_SHA
     secrets: inherit
+    with:
+      allow-bot-users: dancer-automation[bot]
 ```
 
-Set the `CODEX_AUTH_JSON` secret on the consumer repo (contents of `~/.codex/auth.json` from `codex login`):
+Replace `WORKFLOW_COMMIT_SHA` with the immutable SHA. Keep the caller limited
+to invoking this reusable workflow; a `pull_request_target` caller must never
+check out or execute pull-request code.
 
-```
-gh secret set CODEX_AUTH_JSON -R <owner>/<consumer-repo> < ~/.codex/auth.json
-```
+Set `OPENAI_API_KEY` as a consumer repository secret. `CODEX_AUTH_JSON` is a
+fail-closed compatibility signal only: when it is the only credential, the
+result is `AUTH_LEGACY_UNSAFE` and Codex does not run.
 
-Optionally drop a `REVIEW.md` at the repo root with project conventions, escalation rules, and gotchas the reviewer should know — the workflow reads it at runtime.
-
-## Optional inputs
-
-All inputs have defaults; most consumers won't need to set any.
+## Inputs
 
 | Input | Default | Purpose |
 |---|---|---|
-| `runner` | `ubuntu-latest` | Runner label. Override for self-hosted or larger runners. |
-| `model` | `gpt-5.5` | Codex model. Must be subscription-eligible. |
-| `codex-cli-version` | `0.124.0` | Pinned `@openai/codex` npm version. |
-| `sentry-project` | _(empty)_ | Sentry project slug. If unset, the Sentry-context step is skipped. |
-| `sentry-org` | `happycatlabs` | Sentry org slug. Ignored if `sentry-project` is empty. |
-| `sentry-ticket-regex` | _(empty)_ | Regex like `\bMYREPO-\d+\b` for detecting Sentry tickets in PR title/body. |
+| `model` | `gpt-5.5` | Codex model. |
+| `codex-cli-version` | `0.144.1` | Codex CLI version installed by the pinned action. |
+| `allow-users` | empty | Additional exact user actors accepted by codex-action. |
+| `allow-bot-users` | empty | Additional exact bot actors accepted by codex-action. Wildcards are not allowed. |
 
-Pass them via `with:`:
+Every job uses ephemeral GitHub-hosted Linux (`ubuntu-24.04`). A persistent
+self-hosted runner is unsupported by this security contract.
 
-```yaml
-jobs:
-  review:
-    uses: happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml@main
-    secrets: inherit
-    with:
-      sentry-project: my-project
-      sentry-ticket-regex: '\bMYREPO-\d+\b'
+## Review meaning
+
+`review_scope: "diff_v1"` means the model reviews only the complete supplied
+exact diff under trusted default-branch guidance. It cannot browse changed
+files or surrounding source. A `clean` verdict means zero findings in that
+bounded input; it is not whole-repository or feature correctness proof.
+
+Any model finding produces `blocking_findings` and fails the workflow in V1.
+The artifact retains `blocking_count` and `non_blocking_count` as metadata, but
+neither classification permits automatic passage yet.
+
+The publisher uploads `codex-review-result/codex-review-result.json`. See
+[`codex-code-review.md`](codex-code-review.md) for the schema, trust boundaries,
+coverage rules, error codes, canaries, and downstream consumption contract.
+
+## Local validation
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+actionlint -color .github/workflows/codex-code-review.yml
+git diff --check
 ```
-
-## What's in here
-
-- `.github/workflows/codex-code-review.yml` — the reusable workflow.
-- `codex-code-review.md` — architecture and extension guide. Read it before changing the workflow.
-
-## Refreshing `CODEX_AUTH_JSON`
-
-The OAuth refresh token in `auth.json` is long-lived (months) but eventually expires. When CI starts failing with a clear codex-CLI auth error, refresh:
-
-```
-codex login                                                      # regenerates ~/.codex/auth.json
-gh secret set CODEX_AUTH_JSON -R <owner>/<repo> < ~/.codex/auth.json
-```
-
-Each consumer repo has its own `CODEX_AUTH_JSON` (passed via `secrets: inherit`), so refresh per-repo.

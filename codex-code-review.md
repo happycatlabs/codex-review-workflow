@@ -1,296 +1,330 @@
-# `codex-code-review` workflow — architecture and extension guide
+# Codex review architecture
 
-Companion to `.github/workflows/codex-code-review.yml`. Read this before changing the workflow, the prompt, the auth path, or the comment-publishing logic. This workflow is the PR review gate for every consumer repo — getting it wrong stalls every PR across the org.
+This document defines the V1 authority and consumption contract for
+`.github/workflows/codex-code-review.yml`.
 
-This doc is for agents (and humans). It explains *why* the workflow is shaped the way it is, where the load-bearing pieces are, and the patterns to follow when extending it.
+## Four-job trust flow
 
-## Repo layout
+### 1. Guard
 
-This is a `workflow_call`-only reusable workflow. Consumer repos in `happycatlabs/*` invoke it from a thin caller:
+The first job requires the inherited event to be `pull_request_target` before
+any API lookup or secret-bearing job. It then reads the repository, current
+pull request, and current default-branch commit from GitHub's API and requires
+all of the following:
+
+- the pull request is open;
+- its current `base.ref` equals the repository's current `default_branch`;
+- event base/default metadata has not drifted from the API response;
+- head, PR base, and independently resolved default-branch identities are full
+  commit SHAs;
+- PR `base.sha` equals the independently resolved default-branch SHA.
+
+The independently resolved commit is the trusted default-branch revision for
+this review. The guard exports head SHA, base ref, base SHA, state, default
+branch, and trusted default-branch SHA. Every later job depends on successful
+guard completion. A caller
+using `pull_request`, `workflow_dispatch`, a side-branch target, or another
+event cannot reach the model credential.
+
+The caller itself must be loaded from the trusted base and contain only the
+reusable invocation:
 
 ```yaml
-# Consumer: .github/workflows/codex-code-review.yml
 on:
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
-jobs:
-  review:
-    uses: happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml@main
-    secrets: inherit
-    # Optional inputs — see the workflow's on.workflow_call.inputs for the
-    # full list. Defaults work for most repos.
-    # with:
-    #   sentry-project: my-project
-    #   sentry-ticket-regex: '\bMYREPO-\d+\b'
+  pull_request_target:
+    branches: [master]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
 ```
 
-The consumer repo provides:
+The `edited` event covers retargeting, while the API guard remains the actual
+authority. Never check out or execute pull-request code in this caller.
 
-1. The thin caller above.
-2. `CODEX_AUTH_JSON` secret (contents of `~/.codex/auth.json` from `codex login` on a developer machine).
-3. Optional: a `REVIEW.md` at the repo root and/or `.review/*.md` packets for project-specific context. The workflow reads these at runtime.
-4. Optional: `SENTRY_AUTH_TOKEN` secret if the repo passes `sentry-project` as an input.
+### 2. Prepare data packet
 
-## What the workflow does
+Preparation has no secrets. It checks out the guarded head with credentials
+disabled only to let trusted `git` read objects as data. It does not run builds,
+package managers, hooks, scripts, binaries, or any repository-controlled
+program.
 
-On every non-draft PR event (`opened` / `reopened` / `synchronize` / `ready_for_review`):
+It records this immutable review input:
 
-1. Checks out the PR merge commit and fetches base/head refs.
-2. Resolves *incremental review state* from a sticky PR comment.
-3. Builds an isolated review workspace containing only the files the model is allowed to look at.
-4. Builds a structured-output review prompt (gpt-5.5-shaped) with the diff, prior-review context, and PR metadata.
-5. Runs `codex exec` against a Codex/ChatGPT subscription (no API key) with the prompt and a JSON output schema.
-6. Posts a fresh sticky comment carrying the verdict + a hidden state marker, then minimizes the previous sticky as `OUTDATED`.
-7. Gates the PR on the JSON `result` field (`NO_ISSUES` passes; anything else fails).
+- `head_sha`
+- `base_ref`
+- `base_sha`
+- `state`
+- `review_scope: "diff_v1"`
 
-The whole thing is one job, top-to-bottom, in a single workflow file.
+Before writing that input or generating any diff, preparation runs
+`git merge-base --is-ancestor BASE_SHA HEAD_SHA`. GitHub can report the live
+default tip as PR `base.sha` while a behind-base PR head has not incorporated
+that tip. A two-tree `git diff BASE_SHA HEAD_SHA` would then include reversed
+default-only changes. That chronology returns `BASE_NOT_ANCESTOR`; it never
+reaches Codex and never falls through to `INPUT_TRUNCATED`.
 
-## State machine: sticky-comment review state
+Approved guidance is read with `git show` from the guarded default-branch SHA.
+`REVIEW.md` is the required always-on general lens; optional context includes
+`AGENTS.md`, `docs/review.md`, the approved Convex review skill, and matching
+`.review/*.md` packets. The same helper that selects packets writes
+`activated-packets.json`; `general` is always present, and zero matching feature
+packets reports `["general"]`.
+Guidance is inserted as explicitly delimited trusted text in the generated
+prompt. It is never installed as model-discoverable filesystem configuration.
 
-The workflow does *incremental* reviews on subsequent pushes. To do that, it needs to remember:
+Pull-request title and body are not read. No PR source or configuration file is
+copied into the model working directory. Preparation creates only:
 
-- The SHA it last reviewed (so it can compute "files changed since last review")
-- The prior review's `{result, comment_body}` JSON (so the model can dedupe findings and treat the prior review as accepted unless overridden)
+- `model-workspace/codex-prompt.md`
+- `model-workspace/codex-output-schema.json`
 
-Both are stored in a hidden marker at the bottom of the active sticky comment:
+The prompt contains exact `BASE..HEAD` name-status output and a
+`--function-context --unified=20` diff, both generated with external diff and
+text conversion disabled. `git diff --numstat` rejects every binary entry.
+Status and diff are decoded as strict UTF-8; invalid bytes stop preparation.
+Those checks occur before complete coverage can be written.
 
-```
-<!-- codex-review-state:v1 sha=<HEAD_SHA> state=<base64-encoded-JSON> -->
-```
+The prompt has a deterministic 2,000,000-byte cap. Coverage records original
+and included prompt/diff byte counts, prompt/diff hashes, strict UTF-8 encoding,
+binary absence, and whether truncation occurred. A literal `<<<BEGIN` or
+`<<<END` sequence in untrusted status/diff data collides with the reserved
+prompt boundaries. Preparation fails before writing a model prompt or coverage
+claim and publication returns `UNTRUSTED_MARKER_COLLISION`; the raw data is not
+rewritten or claimed as reviewed. Truncation is likewise never silently
+reviewed: Codex is skipped and publication returns `INPUT_TRUNCATED`.
 
-HTML comments render invisibly in the GitHub Markdown view. The base64 encoding keeps the JSON safe from Markdown escaping concerns.
+### 3. No-tools Codex
 
-### Lookup
+The review job has no checkout. Its working directory contains only the
+generated prompt and schema, then the structured output written by the pinned
+action. Codex receives these exact additional arguments:
 
-The "Resolve incremental review state" step paginates the PR's comments and picks the most recently *updated* comment that contains the marker:
-
-```
-[.[] | select(.body | contains("<!-- codex-review-state:v1"))] | sort_by(.updated_at) | last
-```
-
-It then captures both the integer `id` (for REST endpoints) and the `node_id` (the GraphQL global ID, needed for `minimizeComment`).
-
-### Partition
-
-Given `LAST_REVIEWED_SHA`, the workflow computes:
-
-- `FOCUS_FILES` = files changed in `LAST_REVIEWED_SHA..HEAD` — the model analyzes these in detail.
-- `PRIOR_FILES` = files changed in `BASE..LAST_REVIEWED_SHA` — already reviewed; the model only re-evaluates them if a new commit elsewhere makes a previously-invisible issue surface.
-
-The full `BASE..HEAD` diff is still passed to the model. Cross-commit ripple effects stay visible. We *steer attention* with `[FOCUS]` / `[PRIOR]` markers in the changed-files manifest; we don't hard-exclude. (LLMs are reliably better at attention-steering than skip-instructions.)
-
-### Fallback to full review
-
-A full review (`FOCUS_FROM_SHA = BASE_SHA`, no Prior-review section) is the fallback when:
-
-- No sticky comment exists yet (first review on the PR).
-- The recorded SHA is not in the current git history (rebase or force-push orphaned it). Detected via `git cat-file -e`.
-- PR title or any new commit message contains `[full-review]` (manual escape hatch).
-
-When extending, **always preserve the full-review fallback**. It's the safety net that makes the incremental path tolerable.
-
-### Publish: post-then-minimize, not update-in-place
-
-We tried PATCHing the sticky comment in place. Don't go back to that — see the rationale section below.
-
-The current pattern: each run POSTs a fresh comment with the new marker, then collapses the previous sticky via the `minimizeComment` GraphQL mutation with `classifier: OUTDATED`. The previous comment stays in the timeline as a "marked as outdated" line reviewers can expand for history; the new comment lands at the bottom of the timeline, anchored to the commits it actually describes.
-
-## Auth: ChatGPT subscription, not API key
-
-`openai/codex-action@main` only accepts `openai-api-key` as auth and offers no input for ChatGPT-subscription auth (see [openai/codex#3820](https://github.com/openai/codex/issues/3820), open). To bill against a Codex subscription, the workflow drops the action and invokes `codex exec` directly:
-
-1. Install the CLI: `npm install -g @openai/codex@<pinned>`.
-2. Write `~/.codex/auth.json` from the `CODEX_AUTH_JSON` repo secret (mode 600).
-3. Run `codex exec` with `--model`, `--sandbox`, `--cd`, `--output-schema`, `--output-last-message`, and the prompt piped via stdin.
-
-`CODEX_AUTH_JSON` is the entire content of `~/.codex/auth.json` from a developer's machine after running `codex login`. To refresh:
-
-```
-codex login                                   # generates ~/.codex/auth.json
-gh secret set CODEX_AUTH_JSON \
-  -R happycatlabs/fable < ~/.codex/auth.json  # never prints the token
+```json
+["--ephemeral", "--disable", "shell_tool", "--disable", "unified_exec"]
 ```
 
-The OAuth refresh token in the file is long-lived (months). When it expires, the workflow fails with a clear codex-CLI error and the secret needs re-rotating. There's no auto-refresh in CI.
+Local proof against `@openai/codex` 0.144.1 established that an unknown
+`--disable` feature exits nonzero and that `shell_tool` and `unified_exec` are
+both stable disabled features. Static tests lock the exact JSON-array action
+input; the live canary must prove the pinned action/CLI combination still
+honors it.
 
-### Model selection
+The prompt clearly labels the patch as untrusted data. Removing process and
+source-file access prevents command execution and auto-discovered PR authority;
+it does not eliminate prompt-persuasion risk. V1 bounds that residual risk with
+trusted guidance, structured output validation, conservative non-clean
+semantics, and later independent AND-gates. There is no source MCP, retrieval,
+or changed-file browsing in V1.
 
-ChatGPT-subscription auth restricts which models the API will accept. Models like `gpt-5.4-2026-03-05` are API-only and return:
+### 4. Trusted publish
 
-```
-"The 'gpt-5.4-2026-03-05' model is not supported when using Codex with a ChatGPT account."
-```
+Publication runs in a fresh job with no model credential. Immediately before
+finalization it refetches repository default branch and its commit plus PR
+state, head SHA, base ref, and base SHA. It again requires PR `base.sha` to
+equal the independently resolved default-branch SHA. Closed PRs, non-default
+targets, retargeting, head drift, base advancement, disagreement between APIs,
+or lookup failure can never publish `clean`.
 
-Use a subscription-eligible model (currently `gpt-5.5`). Verify the model is available via `codex` docs ([developers.openai.com/codex/models](https://developers.openai.com/codex/models)) before changing.
+It also reads the current Actions run with `actions: read`, requires exactly one
+immutable reusable-workflow entry for
+`happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml`,
+compares GitHub's reported `.sha` with the path suffix, and emits the
+API-reported SHA. The caller's immutable `uses:` pin is the
+revision policy; the reusable workflow does not accept a duplicate
+caller-supplied revision claim from the same trust domain.
 
-## Prompt design
+The job posts a fresh human-readable comment, uploads one named machine
+artifact, writes a short run summary, and fails unless `verdict == "clean"`.
+There is no incremental state, prior-comment marker, sticky comment, or
+minimized-comment lifecycle.
 
-The prompt follows OpenAI's [gpt-5.5 prompting guidance](https://developers.openai.com/api/docs/guides/prompt-guidance?model=gpt-5.5). Two core principles:
+GitHub documents the `referenced_workflows` field in the
+[workflow run API](https://docs.github.com/en/rest/actions/workflow-runs) and
+recommends a commit SHA as the safest reusable-workflow reference in
+[reusing workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 
-1. **Outcome-first, not process-heavy.** Define the destination, success criteria, and constraints; let the model choose the path. Don't spell out the procedure.
-2. **Decision rules over absolutes.** Reserve `ALWAYS` / `NEVER` / `MUST` for true invariants (safety, schema, contracts). Use decision rules for judgment calls.
+## Machine result
 
-### Section layout
+Artifact name: `codex-review-result`
 
-The prompt has stable sections in this order:
+Artifact file: `codex-review-result.json`
 
-| Section | Purpose | When to edit |
-|---|---|---|
-| Role | One-line framing of who the model is and what it produces. | Rarely. Only if the gating output contract changes shape. |
-| Personality | Tone and demeanor (terse, specific, no hedging, don't explain code). | When you want different review *style*, not different *behavior*. |
-| Goal | What outcome the review produces. Anchors "no issues found is preferred." | Rarely. |
-| Workspace | What files the model can see, including `[FOCUS]`/`[PRIOR]` markers. | When you add new context files the workspace prep copies in. |
-| Review mode | How to behave on first review vs re-review. | When the incremental-review semantics change. |
-| Project context | Repo-specific rules (allowlist, Convex skill, Sentry, self-review exclusion). | When repo-specific surfaces are added/removed. |
-| What counts as a finding | The bar — file, line, exact code, triggering input. | Rarely. |
-| Severity | CRITICAL / BUG / RISK definitions. | When severity semantics change. |
-| Invariants | True absolutes: diff-is-source-of-truth, code movement, Convex backwards-compat, repo structure, output schema. | Add when a new invariant emerges from a real incident. |
-| Decision rules | Judgment calls: speculation filter, comments-as-evidence, root-cause framing, etc. | Most extensions go here. |
-| Don't suggest | Style preferences that aren't findings. | When you find a recurring false-positive class. |
-| Output | The JSON shape and the comment-body shape. | When the output schema changes. |
-| Stop | Termination conditions. | Rarely. |
-
-### Where to add a new rule
-
-When a finding pattern recurs and you want to teach the model:
-
-- **Is it a true invariant?** (Will violation always be a problem?) → add to **Invariants**, mark severity, give the failure mode.
-- **Is it a judgment call?** (Whether it's a problem depends on the diff context) → add to **Decision rules** as a one-line decision pattern.
-- **Is it a *domain rule* the model wouldn't infer?** (Convex backwards-compat, repo structure) → goes in **Invariants** if hard, **Project context** if soft.
-- **Is it a class of false positive?** → add to **Don't suggest** with one short justification.
-
-Avoid duplicating across sections — the model will weight any rule listed twice. If you find yourself wanting to repeat, that's a sign the rule belongs in only one section and you weren't sure which.
-
-### Heredoc gotcha
-
-The prompt body is built with `cat <<'PROMPT' > ...` (single-quoted PROMPT). This means **no shell interpolation inside the body** — `${VAR}` strings are literal. Move all dynamic interpolation (PR title, body, SHAs, repo, diff) into the post-heredoc `{ echo ...; }` block, where vars expand normally. Treating the body as static is intentional: it keeps the prompt stable, cacheable, and reviewable as a unit.
-
-## Workspace isolation
-
-The model never sees the full repo. The "Prepare isolated review workspace" step copies in:
-
-- A small set of required context files (`AGENTS.md`, `REVIEW.md`, `docs/review.md`, selected skill files).
-- `.review/` — feature-scoped review packets, picked per-diff via YAML frontmatter `applies_to`.
-- The PR-changed files at HEAD (only).
-- A few `.github/tmp/*` files: changed-files manifest with `[FOCUS]`/`[PRIOR]` tags, prior review JSON, new-commit messages, sentry context.
-- A `CLAUDE.md` symlink to `AGENTS.md` (codex CLI conventions).
-
-Then it deletes the full checkout (`Remove full checkout before review` step) so the codex sandbox can't reach repo files outside the workspace.
-
-When extending, **respect this isolation**. If you want the model to read a new file, copy it into the workspace explicitly. Don't widen the codex sandbox.
-
-## Common change patterns
-
-### Add a new context file the model should read
-
-1. Copy it into the workspace in `Prepare isolated review workspace` (extend `required_files` or add a `copy_dir` call).
-2. Mention the file in the prompt's **Workspace** section so the model knows it's available.
-3. If it carries hard rules, mention "Read X before reviewing — overrides generic instincts" in **Project context**.
-
-### Tighten a recurring false-positive
-
-Add a one-liner to **Don't suggest** with a short justification. Don't add a verbose anti-pattern list — the gpt-5.5 guidance pushes against process-heavy scaffolding. If the model still flags it, the issue is the diff context, not the prompt.
-
-### Change the model
-
-1. Confirm the new model is available on ChatGPT-subscription auth (test by running `codex exec --model <new>` locally with `~/.codex/auth.json` in place).
-2. Update `--model` in the `Run Codex structured review` step.
-3. Re-skim the prompt — gpt-5.5 prefers outcome-first; older models might need more procedural hand-holding. Don't migrate verbatim across model generations.
-
-### Change the output contract
-
-If the JSON schema changes (`{result, comment_body}` becomes something else):
-
-1. Update `Generate structured output schema` step.
-2. Update the prompt's **Output** section.
-3. Update `Inspect structured output`, `Publish review comment`, and `Gate PR on Codex result` to read the new fields.
-4. Update the sticky marker payload (`state=<base64-of-new-shape>`) — old comments with the v1 marker will still parse but the body inside won't match what the new lookup expects. Bump the marker version (`codex-review-state:v2`) and have the lookup tolerate both.
-
-### Change incremental-review semantics
-
-If you want different scope rules (e.g., re-review files within N hops of changed files):
-
-1. Edit the FOCUS/PRIOR computation in `Resolve incremental review state`.
-2. Update the **Review mode** section in the prompt to match.
-3. Bump the marker version if you also change the on-disk state shape.
-
-## Local development
-
-This repo (`happycatlabs/codex-review-workflow`) is the source of truth. Develop here, then validate against a consumer repo's PR.
-
-```
-git clone https://github.com/happycatlabs/codex-review-workflow.git /tmp/codex-review-workflow
-cd /tmp/codex-review-workflow
-# edit .github/workflows/codex-code-review.yml
-python3 -c "import yaml; yaml.safe_load(open('.github/workflows/codex-code-review.yml'))"  # syntax check
+```json
+{
+  "schema_version": "codex-review-result/v1",
+  "verdict": "clean | blocking_findings | error",
+  "head_sha": "40-character reviewed PR head SHA",
+  "base_ref": "reviewed default branch name",
+  "base_sha": "40-character reviewed base SHA",
+  "state": "open",
+  "review_scope": "diff_v1",
+  "activated_packets": ["general"],
+  "coverage": {
+    "complete": true,
+    "truncated": false,
+    "prompt_limit_bytes": 2000000,
+    "prompt_bytes_original": 1234,
+    "prompt_bytes_included": 1234,
+    "prompt_sha256": "64-character SHA-256",
+    "diff_bytes_original": 900,
+    "diff_bytes_included": 900,
+    "diff_sha256": "64-character SHA-256",
+    "diff_encoding": "utf-8",
+    "binary_files": false,
+    "status_bytes_original": 80,
+    "trusted_guidance_bytes": 254
+  },
+  "blocking_count": 0,
+  "non_blocking_count": 0,
+  "finding_fingerprints": [],
+  "workflow_revision": "GitHub-reported reusable-workflow SHA",
+  "reviewer_revision": "codex-action@SHA;codex-cli@VERSION;model@MODEL",
+  "error": null
+}
 ```
 
-To test changes against a real consumer before merging to `main`, push your edits to a branch on this repo, then on the consumer repo open a PR whose caller pins to that branch:
+`clean` means zero model findings in a complete supplied diff. Any finding
+produces `blocking_findings` and fails the job in V1, including a `RISK` tagged
+`blocking: false`. The two counts preserve model classification for humans and
+future policy work; they do not relax this V1 gate.
 
-```yaml
-uses: happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml@my-test-branch
-```
+For `error`, `error` is bounded workflow-owned
+`{"code":"...","reason":"..."}` text. Raw provider output is not copied into
+the reason.
 
-Once the consumer PR's review run looks right, merge here, and the consumer can flip its caller back to `@main` (or pin to a tag, if you start tagging releases).
+### Consumption contract
 
-### Validating without paying for a CI run
+Artifact upload happens before the reusable run's terminal gate. Artifact
+presence alone is not authority. FABLE-196 must independently require all of
+the following from one run:
 
-You can run the prompt-build locally if you populate the env vars and have a checkout of a consumer repo:
+- terminal overall run `conclusion: success`;
+- a supported schema and `review_scope: "diff_v1"`;
+- complete, non-truncated, strict UTF-8, non-binary coverage;
+- current head/base/state/default-branch equality;
+- accepted immutable workflow and reviewer revisions;
+- `verdict: "clean"`;
+- the run's own expected immutable `referenced_workflows` provenance.
 
-```
-export REPOSITORY=<consumer-org>/<consumer-repo>
-export PR_NUMBER=<n>
-export BASE_SHA=$(git rev-parse origin/<base-branch>)
-export HEAD_SHA=$(git rev-parse HEAD)
-export CHECKOUT_DIR=/path/to/consumer-checkout
-export REVIEW_WORKSPACE=/tmp/codex-workspace
-# extract the relevant `run:` blocks from this workflow and execute them
-```
+An accepted reusable-workflow revision is the API-reported SHA and must be an
+ancestor of or equal to the reusable-workflow repository's current protected
+default-branch head, or appear in an explicit allowlist committed to Fable's
+protected default branch. Repository existence alone is not acceptance.
 
-Then run `codex exec --model gpt-5.5 ... < /tmp/codex-workspace/codex-prompt.md` against your own `~/.codex/auth.json`.
+Do not parse the comment or summary for authority.
 
-## Debugging a failed run
+### Error codes
 
-The workflow uploads everything needed to reproduce a review under `Upload Codex artifacts`:
-
-- `codex-prompt.md` — the exact prompt the model received.
-- `codex-output-schema.json` — the JSON schema the output had to satisfy.
-- `codex-output.json` — what the model produced (or empty if the run failed before output).
-- `.github/tmp/changed-files.txt` — the FOCUS/PRIOR-tagged manifest.
-- `.github/tmp/prior-review.json` — what was loaded from the previous sticky.
-- `.github/tmp/new-commit-messages.txt` — commits since the last review.
-- `.github/tmp/incremental-mode.txt` — `incremental` or `full`.
-- `.github/tmp/sentry-review-context.md` — Sentry data passed in (if any).
-
-Download via `gh run download <run-id> -R <consumer-repo> -n codex-review-artifacts`.
-
-### Common failure modes
-
-| Symptom | Likely cause |
+| Code | Meaning |
 |---|---|
-| `model is not supported when using Codex with a ChatGPT account` | API-only model used; pick a subscription-eligible one. |
-| `Codex output file missing` | The codex run errored before writing JSON; check the step's stderr. |
-| Sticky comment lookup returned `null` despite a comment existing | Marker was lost (someone edited the body and removed the HTML comment). Falls back to full review — non-fatal but worth investigating. |
-| `404` on private package fetch | Bun auth path; verify project-local `.npmrc` is being written. |
+| `AUTH_MISSING` | No supported credential exists. |
+| `AUTH_LEGACY_UNSAFE` | Only stateless `CODEX_AUTH_JSON` was available. |
+| `PREPARE_FAILED` | The bounded packet could not be prepared, including binary or invalid UTF-8 diff data. |
+| `BASE_NOT_ANCESTOR` | The live reviewed default-branch base is not an ancestor of the exact PR head. |
+| `UNTRUSTED_MARKER_COLLISION` | Raw status or diff data contains a reserved prompt-boundary marker. |
+| `REVIEW_FAILED` | Codex, provider, runner, or timeout failed. |
+| `MODEL_OUTPUT_MISSING` | Codex wrote no structured output. |
+| `MODEL_OUTPUT_MALFORMED` | Output was not JSON. |
+| `MODEL_OUTPUT_INVALID` | Output violated schema or semantic invariants. |
+| `PR_STATE_LOOKUP_FAILED` | Current PR/default-branch state could not be verified. |
+| `PR_STATE_INVALID` | The PR is no longer open. |
+| `BASE_BRANCH_INVALID` | Current target is not the current default branch. |
+| `BASE_REF_DRIFT` | Reviewed base ref no longer matches current/default base ref. |
+| `HEAD_LOOKUP_FAILED` | Current head identity was invalid. |
+| `STALE_HEAD` | Current head differs from the reviewed head. |
+| `STALE_BASE` | Current base SHA differs from the reviewed base. |
+| `COVERAGE_INVALID` | Coverage metadata is missing or inconsistent. |
+| `INPUT_TRUNCATED` | Bounded input cannot claim complete diff coverage. |
+| `WORKFLOW_PROVENANCE_MISSING` | GitHub did not report one exact immutable reusable-workflow entry. |
 
-## Why some choices were made
+## Finding identity
 
-These are decision records, not code descriptions. Don't undo them without a stronger reason than the original.
+Fingerprints hash canonical `{file, line, normalized_title}` JSON. Severity and
+`blocking` are intentionally excluded because they are mutable adjudication,
+not finding identity. Case/whitespace-only title edits remain stable; moving a
+finding or materially changing its title creates a new identity.
 
-- **Subscription auth, not API key**: API-key billing was hitting quota. The Codex subscription includes generous review-length usage at no incremental cost.
-- **`codex exec` directly, not `openai/codex-action@main`**: the action only accepts `openai-api-key` (no subscription input).
-- **`gpt-5.5`, not `gpt-5.4-*`**: subscription auth restricts to a curated set; `gpt-5.5` is currently the strongest available.
-- **gpt-5.5 prompt structure**: the prior prompt was tuned for an older model and over-specified procedure. gpt-5.5 chooses solution paths efficiently and degrades when over-instructed.
-- **Sticky comment as state store**: simplest persistence that survives across runs and is debuggable in the PR UI itself. Workflow artifacts and a custom GitHub Check are cleaner alternatives if you outgrow this — but only do it once you've validated the prompt shape.
-- **Post-then-minimize, not PATCH-in-place**: PATCHing kept the verdict at its original timeline position, anchoring it above newer commits it actually described. Posting a fresh comment per run keeps the verdict at the bottom of the timeline, alongside the commits it covers; minimizing the previous sticky as OUTDATED preserves history without clutter.
-- **Attention markers (`[FOCUS]`/`[PRIOR]`), not hard exclusions**: LLMs reliably ignore "skip this file" when they can see the file content. Steering attention works; hard exclusions cause flaky output.
-- **Full BASE..HEAD diff always passed**: cross-commit ripple effects (e.g., commit B adds a caller of a function broken in commit A) only catch if the model can see both. Narrowing the diff to just FOCUS files would save tokens but lose this — the cost is acceptable.
-- **`[full-review]` escape hatch in PR title or commit message**: the smallest possible mechanism to force a full re-review without setting up an `issue_comment` event handler. Document it in the PR template if you want it discoverable.
+`CRITICAL` and `BUG` must set `blocking: true`; inconsistent output is
+`MODEL_OUTPUT_INVALID`. `RISK` may carry either blocking value, but every V1
+finding still makes the workflow non-clean.
 
-## References
+## Authentication and runner
 
-- [OpenAI gpt-5.5 prompting guidance](https://developers.openai.com/api/docs/guides/prompt-guidance?model=gpt-5.5)
-- [Codex CLI reference](https://developers.openai.com/codex/cli/reference) (also vendored at `incident-platform-docs/codex-cli-reference.md` in the parent workspace)
-- [openai/codex#3820](https://github.com/openai/codex/issues/3820) — open feature request for ChatGPT-subscription auth in `codex-action`
-- [oven-sh/bun#13764](https://github.com/oven-sh/bun/issues/13764), [#14553](https://github.com/oven-sh/bun/issues/14553) — Bun .npmrc bugs
-- [GitHub `minimizeComment` GraphQL mutation](https://docs.github.com/en/graphql/reference/mutations#minimizecomment)
+`OPENAI_API_KEY` is the only supported CI authentication path. The workflow
+pins `openai/codex-action` at
+`52fe01ec70a42f454c9d2ebd47598f9fd6893d56`, uses
+`permission-profile: :read-only`, and sets `safety-strategy: drop-sudo`.
+
+At that revision, the action's
+[security contract](https://github.com/openai/codex-action/blob/52fe01ec70a42f454c9d2ebd47598f9fd6893d56/SECURITY.md)
+requires `drop-sudo` or an unprivileged user to protect the API key. It starts a
+scoped Responses proxy, removes the key from the proxy environment, and
+recommends ending the job after Codex. Publication therefore uses a fresh job.
+The [pinned action definition](https://github.com/openai/codex-action/blob/52fe01ec70a42f454c9d2ebd47598f9fd6893d56/action.yml)
+also defines JSON-array parsing for `codex-args`.
+
+Every job runs on ephemeral GitHub-hosted Linux (`ubuntu-24.04`). Persistent
+self-hosted runners are unsupported because `drop-sudo` changes job privileges
+and the credential/proxy boundary assumes a disposable host. There is no
+caller-controlled runner input.
+
+`CODEX_AUTH_JSON` is never installed or executed. Its stateless renewable OAuth
+behavior is unsuitable for concurrent CI; when it is the only configured
+credential, the workflow returns `AUTH_LEGACY_UNSAFE`.
+
+## Honest V1 limit
+
+`diff_v1` reviews supplied patch text, not complete changed-file source or the
+whole repository. Even a clean result proves only that the complete bounded
+diff produced no findings under the activated trusted packets. FABLE-188 must
+not widen any docs-only autonomous allowlist until source scope is revisited.
+Trusted source retrieval/MCP is deliberately out of scope.
+
+## Delivery and live canaries
+
+This repository cannot authoritatively self-reference an uncommitted SHA.
+Delivery order is therefore:
+
+1. commit and review this reusable-workflow change;
+2. push it and record the immutable commit SHA;
+3. update the Fable caller to the exact trigger above, pin `uses:` to that SHA,
+   and pass the exact `allow-bot-users: dancer-automation[bot]` actor;
+4. run the live canaries below;
+5. only then consider the result as candidate merge authority.
+
+Required canaries:
+
+1. clean structured output on an unchanged head/base;
+2. concrete finding produces `blocking_findings` and a failed run;
+3. malformed/missing model output produces `error`;
+4. head push during review produces `STALE_HEAD`;
+5. default-branch advance during review produces `STALE_BASE`;
+6. close or retarget during review fails state/base checks;
+7. side-branch target never reaches the credential-bearing review job;
+8. a live base.sha/ancestor canary keeps a PR head behind a new default-only
+   commit and proves preparation returns `BASE_NOT_ANCESTOR`, not
+   `INPUT_TRUNCATED`;
+9. oversized input skips Codex and produces `INPUT_TRUNCATED`;
+10. binary and invalid UTF-8 fixtures fail preparation;
+11. a raw `<<<END` or `<<<BEGIN` sequence returns
+    `UNTRUSTED_MARKER_COLLISION` before Codex runs;
+12. a honeypot diff containing commands, fake instructions, and references to a
+    sentinel executable/file cannot execute or read either;
+13. pinned action plus CLI accepts the structured-output invocation with both
+    execution features disabled.
+
+Until the immutable pin and canaries exist, FABLE-195 is not Done and this
+artifact is not required merge authority.
+
+## Local validation
+
+Tests extract and execute the exact helper embedded in the workflow:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+actionlint -color .github/workflows/codex-code-review.yml
+git diff --check
+```
+
+Fixtures cover packet selection, prompt boundaries/caps/encoding, binary
+rejection, clean and finding results, malformed output, severity consistency,
+stable fingerprints, exact state/head/base chronology, immutable provenance,
+credential isolation, action arguments, and absence of model-visible PR files.
