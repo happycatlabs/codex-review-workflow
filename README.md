@@ -34,9 +34,11 @@ permissions:
 jobs:
   review:
     uses: happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml@WORKFLOW_COMMIT_SHA
-    secrets: inherit
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
     with:
-      allow-bot-users: dancer-automation[bot]
+      allow-bot-users: dancer-automation[bot],dependabot[bot]
 ```
 
 Replace `WORKFLOW_COMMIT_SHA` with the immutable SHA. Keep the caller limited
@@ -45,7 +47,10 @@ check out or execute pull-request code.
 
 Set `OPENAI_API_KEY` as a consumer repository secret. `CODEX_AUTH_JSON` is a
 fail-closed compatibility signal only: when it is the only credential, the
-result is `AUTH_LEGACY_UNSAFE` and Codex does not run.
+result is `AUTH_LEGACY_UNSAFE` and Codex does not run. Pass only these named
+secrets; do not use `secrets: inherit` for the credential-bearing review job.
+If Dependabot updates the immutable workflow pin, list `dependabot[bot]`
+explicitly alongside the automation actor so its update PR can be reviewed.
 
 ## Inputs
 

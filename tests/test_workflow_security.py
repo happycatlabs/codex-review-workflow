@@ -325,6 +325,9 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn(
             "types: [opened, reopened, synchronize, ready_for_review, edited]", docs
         )
+        self.assertIn(
+            "allow-bot-users: dancer-automation[bot],dependabot[bot]", docs
+        )
         self.assertIn("diff_v1", docs)
         self.assertIn("FABLE-188", docs)
         self.assertIn("base.sha/ancestor", docs)
