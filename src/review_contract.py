@@ -25,9 +25,14 @@ from source_context import (
     load_source_context,
 )
 
-CONTRACT_VERSION = "codex-review-result/v2"
+CONTRACT_VERSION = "codex-review-result/v3"
 REVIEW_SCOPE = "source_context_v1"
 MAX_PROMPT_BYTES = 2_000_000
+MAX_FINDINGS = 25
+MAX_COMMENT_BODY_CHARS = 4_000
+MAX_FINDING_BODY_CHARS = 1_000
+MAX_FINDING_FILE_CHARS = 512
+MAX_FINDING_TITLE_CHARS = 160
 EXPECTED_WORKFLOW_PATH = (
     "happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml"
 )
@@ -390,6 +395,7 @@ def normalized_text(value: str) -> str:
 def finding_fingerprint(finding: dict[str, Any]) -> str:
     identity = {
         "file": finding["file"].strip(),
+        "start_line": finding["start_line"],
         "line": finding["line"],
         "title": normalized_text(finding["title"]),
     }
@@ -404,10 +410,16 @@ def validate_model_output(data: Any) -> dict[str, Any]:
         raise ValueError("unexpected output keys")
     if data["result"] not in {"NO_ISSUES", "HAS_FINDINGS"}:
         raise ValueError("invalid result")
-    if not isinstance(data["comment_body"], str) or not data["comment_body"].strip():
+    if (
+        not isinstance(data["comment_body"], str)
+        or not data["comment_body"].strip()
+        or len(data["comment_body"]) > MAX_COMMENT_BODY_CHARS
+    ):
         raise ValueError("comment_body must be non-empty")
     if not isinstance(data["findings"], list):
         raise ValueError("findings must be an array")
+    if len(data["findings"]) > MAX_FINDINGS:
+        raise ValueError("too many findings")
     if data["result"] == "NO_ISSUES" and data["findings"]:
         raise ValueError("NO_ISSUES cannot include findings")
     if data["result"] == "HAS_FINDINGS" and not data["findings"]:
@@ -417,8 +429,10 @@ def validate_model_output(data: Any) -> dict[str, Any]:
             "severity",
             "blocking",
             "file",
+            "start_line",
             "line",
             "title",
+            "body",
         }:
             raise ValueError("invalid finding shape")
         if finding["severity"] not in {"CRITICAL", "BUG", "RISK"}:
@@ -427,12 +441,30 @@ def validate_model_output(data: Any) -> dict[str, Any]:
             raise ValueError("finding blocking must be boolean")
         if finding["severity"] in BLOCKING_SEVERITIES and not finding["blocking"]:
             raise ValueError("blocking severity cannot be marked non-blocking")
-        if not isinstance(finding["file"], str) or not finding["file"].strip():
+        if (
+            not isinstance(finding["file"], str)
+            or not finding["file"].strip()
+            or len(finding["file"]) > MAX_FINDING_FILE_CHARS
+        ):
             raise ValueError("finding file must be non-empty")
+        if type(finding["start_line"]) is not int or finding["start_line"] < 1:
+            raise ValueError("finding start_line must be positive")
         if type(finding["line"]) is not int or finding["line"] < 1:
             raise ValueError("finding line must be positive")
-        if not isinstance(finding["title"], str) or not finding["title"].strip():
+        if finding["start_line"] > finding["line"]:
+            raise ValueError("finding range is reversed")
+        if (
+            not isinstance(finding["title"], str)
+            or not finding["title"].strip()
+            or len(finding["title"]) > MAX_FINDING_TITLE_CHARS
+        ):
             raise ValueError("finding title must be non-empty")
+        if (
+            not isinstance(finding["body"], str)
+            or not finding["body"].strip()
+            or len(finding["body"]) > MAX_FINDING_BODY_CHARS
+        ):
+            raise ValueError("finding body must be non-empty")
     return data
 
 
@@ -577,6 +609,15 @@ def load_lookup_context(
     return data, True
 
 
+def result_findings(model_output: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if model_output is None:
+        return []
+    return [
+        {**finding, "fingerprint": finding_fingerprint(finding)}
+        for finding in model_output["findings"]
+    ]
+
+
 def error_result(
     code: str,
     review_input: dict[str, Any],
@@ -585,10 +626,22 @@ def error_result(
     lookup_context: dict[str, Any],
     workflow_revision: str,
     reviewer_revision: str,
+    model_output: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     if code not in ERROR_REASONS:
         code = "REVIEW_FAILED"
     reason = ERROR_REASONS[code]
+    findings = result_findings(model_output)
+    blocking = sum(1 for finding in findings if finding["blocking"])
+    non_blocking = len(findings) - blocking
+    infrastructure_summary = (
+        f"Codex review infrastructure error (`{code}`): {reason}"
+    )
+    summary = (
+        model_output["comment_body"]
+        if model_output is not None
+        else infrastructure_summary
+    )
     result = {
         "schema_version": CONTRACT_VERSION,
         "verdict": "error",
@@ -596,15 +649,24 @@ def error_result(
         "activated_packets": activated_packets,
         "coverage": coverage,
         "lookup_context": lookup_context,
-        "blocking_count": 0,
-        "non_blocking_count": 0,
-        "finding_fingerprints": [],
+        "summary": summary,
+        "findings": findings,
+        "blocking_count": blocking,
+        "non_blocking_count": non_blocking,
+        "finding_fingerprints": sorted(
+            finding["fingerprint"] for finding in findings
+        ),
         "workflow_revision": workflow_revision,
         "reviewer_revision": reviewer_revision,
         "error": {"code": code, "reason": reason},
+        "publication": {
+            "status": "pending",
+            "mode": "summary",
+            "fallback_reason": code if findings else None,
+            "inline_comment_count": 0,
+        },
     }
-    comment = f"Codex review infrastructure error (`{code}`): {reason}"
-    return result, comment
+    return result, infrastructure_summary
 
 
 def finalize(
@@ -644,6 +706,15 @@ def finalize(
     provenance_path_value = provenance.get("path", "")
     actual_workflow_revision = provenance.get("actual_sha", "")
     expected_path_prefix = f"{EXPECTED_WORKFLOW_PATH}@"
+    try:
+        preserved_model_output = validate_model_output(load_json(model_output_path))
+    except (
+        FileNotFoundError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ):
+        preserved_model_output = None
 
     def fail(code: str, revision: str = actual_workflow_revision):
         return error_result(
@@ -654,6 +725,7 @@ def finalize(
             lookup_context,
             revision,
             reviewer_revision,
+            preserved_model_output,
         )
 
     if not review_input_valid:
@@ -725,34 +797,46 @@ def finalize(
         return fail("REVIEW_FAILED")
     if execution.get("status") != "success":
         return fail(str(execution.get("code", "REVIEW_FAILED")))
-    try:
-        raw_model_output = load_json(model_output_path)
-    except FileNotFoundError:
-        return fail("MODEL_OUTPUT_MISSING")
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return fail("MODEL_OUTPUT_MALFORMED")
-    try:
-        model_output = validate_model_output(raw_model_output)
-    except ValueError:
-        return fail("MODEL_OUTPUT_INVALID")
+    if preserved_model_output is None:
+        try:
+            raw_model_output = load_json(model_output_path)
+        except FileNotFoundError:
+            return fail("MODEL_OUTPUT_MISSING")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return fail("MODEL_OUTPUT_MALFORMED")
+        try:
+            model_output = validate_model_output(raw_model_output)
+        except ValueError:
+            return fail("MODEL_OUTPUT_INVALID")
+    else:
+        model_output = preserved_model_output
 
-    blocking = sum(1 for finding in model_output["findings"] if finding["blocking"])
-    non_blocking = len(model_output["findings"]) - blocking
+    findings = result_findings(model_output)
+    blocking = sum(1 for finding in findings if finding["blocking"])
+    non_blocking = len(findings) - blocking
     result = {
         "schema_version": CONTRACT_VERSION,
-        "verdict": "blocking_findings" if model_output["findings"] else "clean",
+        "verdict": "blocking_findings" if findings else "clean",
         **review_input,
         "activated_packets": packets,
         "coverage": coverage,
         "lookup_context": lookup_context,
+        "summary": model_output["comment_body"],
+        "findings": findings,
         "blocking_count": blocking,
         "non_blocking_count": non_blocking,
         "finding_fingerprints": sorted(
-            finding_fingerprint(finding) for finding in model_output["findings"]
+            finding["fingerprint"] for finding in findings
         ),
         "workflow_revision": actual_workflow_revision,
         "reviewer_revision": reviewer_revision,
         "error": None,
+        "publication": {
+            "status": "pending",
+            "mode": "inline" if findings else "summary",
+            "fallback_reason": None,
+            "inline_comment_count": 0,
+        },
     }
     return result, model_output["comment_body"]
 

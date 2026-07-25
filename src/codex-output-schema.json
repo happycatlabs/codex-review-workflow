@@ -11,10 +11,20 @@
           "severity": {"type": "string", "enum": ["CRITICAL", "BUG", "RISK"]},
           "blocking": {"type": "boolean"},
           "file": {"type": "string", "minLength": 1},
+          "start_line": {"type": "integer", "minimum": 1},
           "line": {"type": "integer", "minimum": 1},
-          "title": {"type": "string", "minLength": 1}
+          "title": {"type": "string", "minLength": 1},
+          "body": {"type": "string", "minLength": 1}
         },
-        "required": ["severity", "blocking", "file", "line", "title"],
+        "required": [
+          "severity",
+          "blocking",
+          "file",
+          "start_line",
+          "line",
+          "title",
+          "body"
+        ],
         "additionalProperties": false
       }
     }

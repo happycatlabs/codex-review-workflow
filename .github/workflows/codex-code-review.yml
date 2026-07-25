@@ -332,6 +332,11 @@ jobs:
             --output "${METADATA_DIR}/source-context.json" \
             --error-output "${REVIEW_BUNDLE}/review-execution.json"
 
+          python3 "trusted-workflow/src/review_publication.py" build-comment-map \
+            --repository "${CHECKOUT_DIR}" \
+            --review-input "${METADATA_DIR}/review-input.json" \
+            --output "${METADATA_DIR}/comment-map.json"
+
       - name: Upload prepared review data
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -541,7 +546,6 @@ jobs:
       actions: read
       contents: read
       pull-requests: write
-      issues: write
     env:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       REPOSITORY: ${{ github.repository }}
@@ -615,6 +619,17 @@ jobs:
           if [ ! -s codex-review-input/metadata/lookup-context.json ]; then
             printf '{"complete":false,"source":null,"intent":null}\n' \
               > codex-review-input/metadata/lookup-context.json
+          fi
+          if [ ! -s codex-review-input/metadata/comment-map.json ]; then
+            jq -n \
+              --argjson pull_number "${PR_NUMBER}" \
+              --arg head "${EXPECTED_HEAD_SHA}" \
+              --arg base_ref "${EXPECTED_BASE_REF}" \
+              --arg base_sha "${EXPECTED_BASE_SHA}" \
+              '{schema_version:"codex-review-comment-map/v1",complete:false,
+                pull_number:$pull_number,head_sha:$head,base_ref:$base_ref,
+                base_sha:$base_sha,diff_sha256:("0"*64),files:{}}' \
+              > codex-review-input/metadata/comment-map.json
           fi
           if [ ! -s codex-review-input/review-execution.json ]; then
             if [ "${{ needs.prepare.result }}" != success ]; then
@@ -771,6 +786,10 @@ jobs:
               code=PREPARE_FAILED
               reason='The bounded review input could not be prepared.'
             fi
+            # Backticks are literal Markdown formatting around the error code.
+            # shellcheck disable=SC2016
+            printf 'Codex review infrastructure error (`%s`): %s\n' "${code}" "${reason}" \
+              > codex-review-result/comment-body.md
             jq -n \
               --argjson pull_number "${PR_NUMBER}" \
               --arg head "${EXPECTED_HEAD_SHA}" \
@@ -781,21 +800,21 @@ jobs:
               --arg reviewer_revision "${REVIEWER_REVISION}" \
               --arg code "${code}" \
               --arg reason "${reason}" \
+              --rawfile summary codex-review-result/comment-body.md \
               --slurpfile coverage codex-review-input/metadata/coverage.json \
               --slurpfile lookup codex-review-input/metadata/lookup-context.json \
-              '{schema_version:"codex-review-result/v2",verdict:"error",
+              '{schema_version:"codex-review-result/v3",verdict:"error",
                 pull_number:$pull_number,head_sha:$head,
                 base_ref:$base_ref,base_sha:$base_sha,state:$state,
                 review_scope:"source_context_v1",
-                activated_packets:["general"],coverage:$coverage[0],blocking_count:0,
-                lookup_context:$lookup[0],
+                activated_packets:["general"],coverage:$coverage[0],
+                lookup_context:$lookup[0],summary:($summary|rtrimstr("\n")),findings:[],
+                blocking_count:0,
                 non_blocking_count:0,finding_fingerprints:[],workflow_revision:$workflow_revision,
-                reviewer_revision:$reviewer_revision,error:{code:$code,reason:$reason}}' \
+                reviewer_revision:$reviewer_revision,error:{code:$code,reason:$reason},
+                publication:{status:"pending",mode:"summary",
+                  fallback_reason:null,inline_comment_count:0}}' \
               > codex-review-result/codex-review-result.json
-            # Backticks are literal Markdown formatting around the error code.
-            # shellcheck disable=SC2016
-            printf 'Codex review infrastructure error (`%s`): %s\n' "${code}" "${reason}" \
-              > codex-review-result/comment-body.md
             exit 0
           fi
           python3 "${helper}" finalize \
@@ -811,21 +830,198 @@ jobs:
             --output codex-review-result/codex-review-result.json \
             --comment-output codex-review-result/comment-body.md
 
+      - name: Plan COMMENT review publication
+        run: |
+          set -euo pipefail
+          helper=trusted-workflow/src/review_publication.py
+          if [ -s "${helper}" ]; then
+            python3 "${helper}" plan \
+              --result codex-review-result/codex-review-result.json \
+              --comment-map codex-review-input/metadata/comment-map.json \
+              --output codex-review-result/codex-review-result.json \
+              --request-output codex-review-result/review-request.json \
+              --summary-request-output codex-review-result/summary-review-request.json
+          else
+            jq -n \
+              '{body:"Codex review publication helper is unavailable.",
+                event:"COMMENT"}' \
+              > codex-review-result/review-request.json
+            cp codex-review-result/review-request.json \
+              codex-review-result/summary-review-request.json
+            jq '.verdict="error"
+              | .error={code:"COMMENT_HELPER_MISSING",
+                  reason:"The trusted publication helper is unavailable."}
+              | .publication={status:"failed",mode:"summary",
+                  fallback_reason:"COMMENT_HELPER_MISSING",inline_comment_count:0}' \
+              codex-review-result/codex-review-result.json \
+              > codex-review-result/codex-review-result.tmp
+            mv codex-review-result/codex-review-result.tmp \
+              codex-review-result/codex-review-result.json
+          fi
+
+      - name: Revalidate and publish COMMENT review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          helper=trusted-workflow/src/review_publication.py
+          result=codex-review-result/codex-review-result.json
+          request=codex-review-result/review-request.json
+          summary_request=codex-review-result/summary-review-request.json
+          planned_status=$(jq -r '.publication.status' "${result}")
+          planned_mode=$(jq -r '.publication.mode' "${result}")
+          planned_fallback=$(jq -r '.publication.fallback_reason // ""' "${result}")
+          planned_inline=$(jq -r '.publication.inline_comment_count' "${result}")
+          status=failed
+          mode="${planned_mode}"
+          fallback_reason="${planned_fallback}"
+          inline_count="${planned_inline}"
+
+          repo_json=$(mktemp)
+          pr_json=$(mktemp)
+          default_commit_json=$(mktemp)
+          state_valid=false
+          generation_current=false
+          refresh_generation_state() {
+            state_valid=false
+            generation_current=false
+            if gh api "repos/${REPOSITORY}" > "${repo_json}" \
+                && gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" > "${pr_json}"; then
+              default_branch=$(jq -r '.default_branch // ""' "${repo_json}")
+              encoded_default_branch=$(jq -rn --arg value "${default_branch}" '$value | @uri')
+              if [ -n "${default_branch}" ] \
+                  && gh api "repos/${REPOSITORY}/commits/${encoded_default_branch}" \
+                    > "${default_commit_json}"; then
+                state_valid=true
+                current_state=$(jq -r '.state // ""' "${pr_json}")
+                current_head=$(jq -r '.head.sha // ""' "${pr_json}")
+                current_base_ref=$(jq -r '.base.ref // ""' "${pr_json}")
+                current_base_sha=$(jq -r '.base.sha // ""' "${pr_json}")
+                current_default_sha=$(jq -r '.sha // ""' "${default_commit_json}")
+                if [ "${current_state}" = open ] \
+                    && [ "${current_head}" = "${EXPECTED_HEAD_SHA}" ] \
+                    && [ "${current_base_ref}" = "${EXPECTED_BASE_REF}" ] \
+                    && [ "${current_base_sha}" = "${EXPECTED_BASE_SHA}" ] \
+                    && [ "${default_branch}" = "${EXPECTED_BASE_REF}" ] \
+                    && [ "${current_default_sha}" = "${EXPECTED_BASE_SHA}" ]; then
+                  generation_current=true
+                fi
+              fi
+            fi
+          }
+          refresh_generation_state
+
+          publish_review() {
+            local input=$1
+            local response=$2
+            local error=$3
+            gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              --input "${input}" --include > "${response}" 2> "${error}"
+          }
+
+          if [ "${planned_status}" = failed ]; then
+            status=failed
+          elif [ "${state_valid}" != true ]; then
+            fallback_reason=PUBLICATION_STATE_LOOKUP_FAILED
+            inline_count=0
+          elif [ "${generation_current}" != true ]; then
+            fallback_reason=STALE_BEFORE_PUBLICATION
+            mode=summary
+            inline_count=0
+            jq 'if (.body | contains("Inline publication fallback:"))
+                then . else
+                  .body += "\n\nInline publication fallback: `STALE_BEFORE_PUBLICATION`."
+                end | del(.commit_id)' "${summary_request}" \
+              > codex-review-result/stale-summary-review-request.json
+            if publish_review \
+                codex-review-result/stale-summary-review-request.json \
+                codex-review-result/review-response.txt \
+                codex-review-result/review-error.txt; then
+              status=published
+            fi
+          elif publish_review "${request}" \
+              codex-review-result/review-response.txt \
+              codex-review-result/review-error.txt; then
+            status=published
+          elif [ "${planned_mode}" = inline ]; then
+            if grep -Eq '(^HTTP/[^ ]+ 422|\(HTTP 422\))' \
+                codex-review-result/review-response.txt \
+                codex-review-result/review-error.txt; then
+              refresh_generation_state
+              mode=summary
+              inline_count=0
+              if [ "${state_valid}" != true ]; then
+                fallback_reason=PUBLICATION_STATE_LOOKUP_FAILED
+              elif [ "${generation_current}" != true ]; then
+                fallback_reason=STALE_BEFORE_PUBLICATION
+                jq 'if (.body | contains("Inline publication fallback:"))
+                    then . else
+                      .body += "\n\nInline publication fallback: `STALE_BEFORE_PUBLICATION`."
+                    end | del(.commit_id)' "${summary_request}" \
+                  > codex-review-result/api-summary-review-request.json
+                if publish_review \
+                    codex-review-result/api-summary-review-request.json \
+                    codex-review-result/summary-response.txt \
+                    codex-review-result/summary-error.txt; then
+                  status=published
+                fi
+              else
+                fallback_reason=GITHUB_422
+                jq --arg reason "${fallback_reason}" \
+                  '.body += "\n\nInline publication fallback: `" + $reason + "`."' \
+                  "${summary_request}" \
+                  > codex-review-result/api-summary-review-request.json
+                if publish_review \
+                    codex-review-result/api-summary-review-request.json \
+                    codex-review-result/summary-response.txt \
+                    codex-review-result/summary-error.txt; then
+                  status=published
+                fi
+              fi
+            else
+              fallback_reason=INLINE_PUBLICATION_FAILED
+              inline_count=0
+            fi
+          else
+            fallback_reason=SUMMARY_PUBLICATION_FAILED
+          fi
+
+          if [ -s "${helper}" ]; then
+            python3 "${helper}" record \
+              --result "${result}" \
+              --status "${status}" \
+              --mode "${mode}" \
+              --fallback-reason "${fallback_reason}" \
+              --inline-comment-count "${inline_count}" \
+              --output "${result}"
+          else
+            jq \
+              --arg status "${status}" \
+              --arg mode "${mode}" \
+              --arg reason "${fallback_reason}" \
+              --argjson inline_count "${inline_count}" \
+              '.publication={status:$status,mode:$mode,
+                fallback_reason:(if $reason == "" then null else $reason end),
+                inline_comment_count:$inline_count}
+              | if $status == "failed" and .verdict == "clean"
+                then .verdict="error"
+                | .error={code:"PUBLICATION_FAILED",
+                    reason:"The exact-head review result could not be published."}
+                else . end' "${result}" > codex-review-result/codex-review-result.tmp
+            mv codex-review-result/codex-review-result.tmp "${result}"
+          fi
+
       - name: Upload exact-head machine result
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ env.RESULT_ARTIFACT }}
           path: codex-review-result/codex-review-result.json
           if-no-files-found: error
           retention-days: 30
-
-      - name: Publish fresh review comment
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            --method POST --raw-field body="$(cat codex-review-result/comment-body.md)" >/dev/null
 
       - name: Write run summary
         run: |
@@ -843,6 +1039,11 @@ jobs:
             echo "- Packets: \`$(jq -c '.activated_packets' "${result}")\`"
             echo "- Blocking: \`$(jq -r '.blocking_count' "${result}")\`"
             echo "- Non-blocking: \`$(jq -r '.non_blocking_count' "${result}")\`"
+            echo "- Publication: \`$(jq -r '.publication.status + "/" + .publication.mode' "${result}")\`"
+            fallback_reason=$(jq -r '.publication.fallback_reason // empty' "${result}")
+            if [ -n "${fallback_reason}" ]; then
+              echo "- Publication fallback: \`${fallback_reason}\`"
+            fi
             echo "- Artifact: \`${RESULT_ARTIFACT}\`"
             error_code=$(jq -r '.error.code // empty' "${result}")
             if [ -n "${error_code}" ]; then
@@ -853,9 +1054,11 @@ jobs:
       - name: Gate pull request on machine verdict
         run: |
           set -euo pipefail
-          verdict=$(jq -r '.verdict' codex-review-result/codex-review-result.json)
-          if [ "${verdict}" != clean ]; then
-            echo "Codex review gate failed closed: verdict=${verdict}"
+          result=codex-review-result/codex-review-result.json
+          verdict=$(jq -r '.verdict' "${result}")
+          publication=$(jq -r '.publication.status' "${result}")
+          if [ "${verdict}" != clean ] || [ "${publication}" != published ]; then
+            echo "Codex review gate failed closed: verdict=${verdict} publication=${publication}"
             exit 1
           fi
           echo "Codex source_context_v1 review passed for ${EXPECTED_HEAD_SHA}"

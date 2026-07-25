@@ -43,8 +43,10 @@ def finding(
         "severity": severity,
         "blocking": blocking,
         "file": "lib/example.ts",
+        "start_line": 42,
         "line": 42,
         "title": title,
+        "body": "The current fallback returns the wrong value.",
     }
 
 
@@ -599,6 +601,8 @@ class FinalizeTests(unittest.TestCase):
         self.assertEqual(result["activated_packets"], ["chat", "general"])
         self.assertEqual(result["blocking_count"], 0)
         self.assertIsNone(result["error"])
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(result["publication"]["status"], "pending")
         self.assertEqual(comment, clean_model()["comment_body"])
 
     def test_any_finding_is_non_clean_and_fingerprints_ignore_classification(self):
@@ -616,6 +620,14 @@ class FinalizeTests(unittest.TestCase):
         self.assertEqual(result["blocking_count"], 1)
         self.assertEqual(result["non_blocking_count"], 1)
         self.assertEqual(len(set(result["finding_fingerprints"])), 2)
+        self.assertEqual(
+            result["findings"][0]["fingerprint"],
+            contract.finding_fingerprint(payload["findings"][0]),
+        )
+        self.assertEqual(
+            result["findings"][0]["body"],
+            "The current fallback returns the wrong value.",
+        )
 
         original = payload["findings"][1]
         reclassified = {**original, "severity": "BUG", "blocking": True}
@@ -674,6 +686,18 @@ class FinalizeTests(unittest.TestCase):
             "findings": [finding()],
         }
         payload["findings"][0]["line"] = True
+
+        result, _ = self.finalize(payload)
+
+        self.assertEqual(result["error"]["code"], "MODEL_OUTPUT_INVALID")
+
+    def test_reversed_finding_range_is_invalid(self):
+        payload = {
+            "result": "HAS_FINDINGS",
+            "comment_body": "BUG: invalid line range.",
+            "findings": [finding()],
+        }
+        payload["findings"][0]["start_line"] = 43
 
         result, _ = self.finalize(payload)
 
@@ -800,6 +824,31 @@ class FinalizeTests(unittest.TestCase):
 
         self.assertEqual(stale_head["error"]["code"], "STALE_HEAD")
         self.assertEqual(stale_base["error"]["code"], "STALE_BASE")
+
+    def test_stale_generation_preserves_valid_findings_for_summary_fallback(self):
+        payload = {
+            "result": "HAS_FINDINGS",
+            "comment_body": "BUG: wrong fallback.",
+            "findings": [finding()],
+        }
+        result, _ = self.finalize(
+            payload,
+            current={
+                "lookup_success": True,
+                "state": "open",
+                "head_sha": "f" * 40,
+                "base_ref": "master",
+                "base_sha": BASE_SHA,
+                "default_branch": "master",
+                "default_branch_sha": BASE_SHA,
+            },
+        )
+
+        self.assertEqual(result["verdict"], "error")
+        self.assertEqual(result["error"]["code"], "STALE_HEAD")
+        self.assertEqual(len(result["findings"]), 1)
+        self.assertEqual(result["blocking_count"], 1)
+        self.assertEqual(result["summary"], payload["comment_body"])
 
     def test_closed_lookup_failure_and_default_branch_drift_fail_closed(self):
         closed, _ = self.finalize(

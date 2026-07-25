@@ -12,9 +12,10 @@ The V2 workflow has five jobs:
 3. resolve one exact owner-bound FABLE ticket through protected read-only
    credentials, then seal the model prompt after those credentials leave scope;
 4. run Codex with no source checkout and both execution tools disabled;
-5. refetch the PR snapshot, verify immutable workflow provenance, publish a
-   machine artifact and fresh comment, and fail closed unless the result is
-   clean.
+5. refetch the PR snapshot, verify immutable workflow provenance, derive
+   commentable lines from the exact diff in trusted code, and publish one
+   `COMMENT` review plus a machine artifact before failing closed unless the
+   result is clean.
 
 ## Consumer setup
 
@@ -33,7 +34,7 @@ permissions:
   actions: read
   contents: read
   pull-requests: write
-  issues: write
+  issues: read
 
 jobs:
   review:
@@ -93,7 +94,16 @@ Any model finding produces `blocking_findings` and fails the workflow in V1.
 The artifact retains `blocking_count` and `non_blocking_count` as metadata, but
 neither classification permits automatic passage yet.
 
-The publisher uploads `codex-review-result/codex-review-result.json`. See
+The publisher uploads `codex-review-result/codex-review-result.json`. A
+line-addressable finding becomes a resolvable inline thread only when its
+model-supplied file/range matches right-side added lines in the exact diff.
+Model output never chooses GitHub `side`, diff position, or review event. If
+any finding cannot be anchored, the result exceeds the 20-comment publication
+limit, the generation changes, or GitHub rejects the inline review, the
+publisher submits one complete summary `COMMENT` review instead. Findings are
+never partially published or discarded.
+
+See
 [`codex-code-review.md`](codex-code-review.md) for the schema, trust boundaries,
 coverage rules, error codes, canaries, and downstream consumption contract.
 

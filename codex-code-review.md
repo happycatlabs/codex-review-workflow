@@ -95,9 +95,20 @@ lookup failure, or invalid identity before accepting model output.
 It reads the Actions run with `actions: read`, requires exactly one immutable
 reusable-workflow provenance entry for
 `happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml`,
-and reports GitHub's exact SHA. The job uploads one machine artifact, posts a
-fresh comment, and fails unless `verdict == "clean"`. Comments and summaries
-are not authority.
+and reports GitHub's exact SHA. Trusted helper code independently derives
+right-side added-line ranges from the exact `BASE..HEAD` diff. The model supplies
+only candidate file/range hints; it cannot supply GitHub side, diff position,
+commit, or review event.
+
+The publisher re-fetches the PR again immediately before writing and submits
+one review with `event: COMMENT`. When every finding is addressable and the
+count is at most 20, the review contains resolvable inline threads bound to the
+exact head. Invalid or stale coordinates, comment overflow, generation drift,
+and inline API rejection produce one complete summary review with a stable
+fallback reason. Publication is all-inline or all-summary, never partial. A
+publication failure invalidates a clean result. The job then uploads the
+machine artifact and fails unless both `verdict == "clean"` and publication
+succeeded. Reviews, comments, and summaries are not approval or merge authority.
 
 ## Machine result
 
@@ -105,7 +116,7 @@ Artifact: `codex-review-result/codex-review-result.json`
 
 ```json
 {
-  "schema_version": "codex-review-result/v2",
+  "schema_version": "codex-review-result/v3",
   "verdict": "clean | blocking_findings | error",
   "pull_number": 198,
   "head_sha": "40-character reviewed PR head SHA",
@@ -153,12 +164,31 @@ Artifact: `codex-review-result/codex-review-result.json`
       "collected_at_epoch": 0
     }
   },
-  "blocking_count": 0,
+  "summary": "Complete concise review summary.",
+  "findings": [
+    {
+      "severity": "BUG",
+      "blocking": true,
+      "file": "lib/example.ts",
+      "start_line": 42,
+      "line": 42,
+      "title": "Concrete failure",
+      "body": "Standalone finding body with trigger and impact.",
+      "fingerprint": "64-character stable SHA-256"
+    }
+  ],
+  "blocking_count": 1,
   "non_blocking_count": 0,
-  "finding_fingerprints": [],
+  "finding_fingerprints": ["64-character stable SHA-256"],
   "workflow_revision": "GitHub-reported reusable-workflow SHA",
   "reviewer_revision": "codex-action@SHA;codex-cli@VERSION;model@MODEL",
-  "error": null
+  "error": null,
+  "publication": {
+    "status": "published | failed",
+    "mode": "inline | summary",
+    "fallback_reason": null,
+    "inline_comment_count": 0
+  }
 }
 ```
 
@@ -171,13 +201,14 @@ findings. Any finding produces `blocking_findings`, including a non-blocking
 Downstream consumers must independently require:
 
 - terminal overall run `conclusion: success`;
-- schema `codex-review-result/v2` and scope `source_context_v1`;
+- schema `codex-review-result/v3` and scope `source_context_v1`;
 - matching pull, head, base, state, and current default branch;
 - complete non-truncated coverage and lookup manifests;
 - intent ticket/team matching the trusted task contract;
 - accepted immutable workflow and reviewer revisions;
 - `verdict: "clean"`;
 - matching immutable `referenced_workflows` provenance.
+- successful publication; inline and summary reviews remain report-only.
 
 ## Failure contract
 
@@ -195,9 +226,21 @@ Preparation and lookup failures are explicit and can never become clean:
 | `MODEL_OUTPUT_MISSING`, `MODEL_OUTPUT_MALFORMED`, `MODEL_OUTPUT_INVALID`, `REVIEW_FAILED` | Review execution did not yield valid output. |
 | `PR_STATE_LOOKUP_FAILED`, `PR_STATE_INVALID`, `BASE_BRANCH_INVALID`, `BASE_REF_DRIFT`, `STALE_HEAD`, `STALE_BASE` | Current exact generation no longer matches. |
 | `WORKFLOW_PROVENANCE_MISSING` | Immutable reusable-workflow provenance is absent. |
+| `STALE_BEFORE_PUBLICATION`, `PUBLICATION_FAILED` | The final write-time generation check drifted or the review could not be published. |
 
 For `error`, the reason is bounded workflow-owned text; raw provider bodies,
 tokens, and credentials are never copied into the result.
+
+Publication fallback reasons are a separate, stable diagnostic enum:
+
+| Codes | Meaning |
+|---|---|
+| `INVALID_LOCATION`, `COMMENT_MAP_INVALID` | At least one finding cannot be proven to address an exact right-side changed line. |
+| `INLINE_COMMENT_LIMIT_EXCEEDED` | The finding count exceeds the bounded 20-comment inline review limit. |
+| `GITHUB_422` | GitHub definitively rejected the validated inline review, so the exact generation was revalidated and published as a summary. |
+| `STALE_BEFORE_PUBLICATION` | The pull request generation changed during the final write boundary; the old result is retained only in a summary without the old commit binding. |
+| `PUBLICATION_STATE_LOOKUP_FAILED`, `INLINE_PUBLICATION_FAILED`, `SUMMARY_PUBLICATION_FAILED` | Publication could not safely determine or complete a write; no ambiguous retry is attempted. |
+| `COMMENT_HELPER_MISSING` | The immutable trusted publication helper was unavailable, so publication failed without posting a partial result. |
 
 ## Immutable helper packaging
 
@@ -219,7 +262,10 @@ disposable PRs that prove:
    review is found;
 3. clean, finding, missing/malformed context, wrong team, provider failure,
    head drift, and base drift remain exact-generation bound;
-4. command-shaped source/ticket data cannot execute or obtain credentials.
+4. a valid changed line creates an exact-head inline thread, while invalid
+   location, overflow, stale generation, and GitHub `422` create complete
+   summary reviews;
+5. command-shaped source/ticket data cannot execute or obtain credentials.
 
 Do not merge a disposable proof PR. Until the immutable pin and proof exist,
 this artifact is not merge authority.
