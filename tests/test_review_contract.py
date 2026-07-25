@@ -5,7 +5,9 @@ import importlib.util
 import json
 import pathlib
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from argparse import Namespace
 
@@ -15,21 +17,16 @@ WORKFLOW = ROOT / ".github/workflows/codex-code-review.yml"
 HEAD_SHA = "a" * 40
 BASE_SHA = "b" * 40
 WORKFLOW_SHA = "c" * 40
+PULL_NUMBER = 198
 
 
 def load_contract():
-    workflow = WORKFLOW.read_text()
-    start_marker = "          # BEGIN REVIEW_CONTRACT\n"
-    end_marker = "          # END REVIEW_CONTRACT\n"
-    start = workflow.index(start_marker) + 10
-    end = workflow.index(end_marker) + 10 + len("# END REVIEW_CONTRACT\n")
-    source = "\n".join(
-        line[10:] if line.startswith("          ") else line
-        for line in workflow[start:end].splitlines()
-    )
-    spec = importlib.util.spec_from_loader("review_contract", loader=None)
+    source_path = ROOT / "src/review_contract.py"
+    sys.path.insert(0, str(source_path.parent))
+    spec = importlib.util.spec_from_file_location("review_contract", source_path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    exec(compile(source, str(WORKFLOW), "exec"), module.__dict__)
+    spec.loader.exec_module(module)
     return module
 
 
@@ -74,6 +71,89 @@ def complete_coverage() -> dict:
         "binary_files": False,
         "status_bytes_original": 20,
         "trusted_guidance_bytes": 10,
+        "source_context_bytes": 20,
+        "intent_context_bytes": 20,
+    }
+
+
+def review_input(**overrides) -> dict:
+    return {
+        "pull_number": PULL_NUMBER,
+        "head_sha": HEAD_SHA,
+        "base_ref": "master",
+        "base_sha": BASE_SHA,
+        "state": "open",
+        "review_scope": contract.REVIEW_SCOPE,
+        **overrides,
+    }
+
+
+def source_context() -> dict:
+    entries = [
+        {
+            "path": "lib/example.ts",
+            "roles": ["changed"],
+            "content": "export const value = 1;\n",
+        }
+    ]
+    canonical = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "manifest": {
+            "complete": True,
+            "truncated": False,
+            "pull_number": PULL_NUMBER,
+            "head_sha": HEAD_SHA,
+            "base_ref": "master",
+            "base_sha": BASE_SHA,
+            "files_scanned": 1,
+            "bytes_scanned": len(entries[0]["content"].encode()),
+            "files_included": 1,
+            "bytes_included": len(entries[0]["content"].encode()),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+            "symlinks_excluded": 0,
+            "generated_files_excluded": 0,
+            "generated_imports_excluded": 0,
+        },
+        "entries": entries,
+    }
+
+
+def intent_context(*, collected_at_epoch: int | None = None) -> dict:
+    intent = {
+        "title": "Trusted lookup",
+        "description": "Bounded exact-ticket intent.",
+        "status": {"name": "In Progress", "type": "started"},
+        "comments": [],
+    }
+    canonical = json.dumps(intent, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "manifest": {
+            "complete": True,
+            "truncated": False,
+            "pull_number": PULL_NUMBER,
+            "head_sha": HEAD_SHA,
+            "base_ref": "master",
+            "base_sha": BASE_SHA,
+            "ticket_identifier": "FABLE-198",
+            "team_key": "FABLE",
+            "issue_updated_at": "2026-07-25T00:00:00.000Z",
+            "collected_at_epoch": (
+                int(time.time())
+                if collected_at_epoch is None
+                else collected_at_epoch
+            ),
+            "bytes_included": len(canonical),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+        },
+        "intent": intent,
+    }
+
+
+def lookup_context() -> dict:
+    return {
+        "complete": True,
+        "source": source_context()["manifest"],
+        "intent": intent_context()["manifest"],
     }
 
 
@@ -222,18 +302,12 @@ class PromptPacketTests(unittest.TestCase):
         instructions.write_text("Review the supplied diff only.\n")
         activated = root / "activated.json"
         activated.write_text('["chat", "general"]\n')
-        review_input = root / "review-input.json"
-        review_input.write_text(
-            json.dumps(
-                {
-                    "head_sha": HEAD_SHA,
-                    "base_ref": "master",
-                    "base_sha": BASE_SHA,
-                    "state": "open",
-                    "review_scope": "diff_v1",
-                }
-            )
-        )
+        review_input_path = root / "review-input.json"
+        review_input_path.write_text(json.dumps(review_input()))
+        source_path = root / "source-context.json"
+        source_path.write_text(json.dumps(source_context()))
+        intent_path = root / "intent-context.json"
+        intent_path.write_text(json.dumps(intent_context()))
         status_path = root / "status.txt"
         if isinstance(status, bytes):
             status_path.write_bytes(status)
@@ -248,18 +322,40 @@ class PromptPacketTests(unittest.TestCase):
             diff_path.write_text(diff)
         output = root / "prompt.md"
         coverage_path = root / "coverage.json"
+        lookup_path = root / "lookup-context.json"
 
         return temporary, {
             "instructions_path": instructions,
             "trusted_context": trusted,
             "activated_packets_path": activated,
-            "review_input_path": review_input,
+            "review_input_path": review_input_path,
             "numstat_path": numstat_path,
             "status_path": status_path,
             "diff_path": diff_path,
+            "source_context_path": source_path,
+            "intent_context_path": intent_path,
             "output_path": output,
             "coverage_path": coverage_path,
+            "lookup_context_path": lookup_path,
         }
+
+    def command_args(self, paths: dict[str, pathlib.Path]) -> Namespace:
+        return Namespace(
+            instructions=str(paths["instructions_path"]),
+            trusted_context=str(paths["trusted_context"]),
+            activated_packets=str(paths["activated_packets_path"]),
+            review_input=str(paths["review_input_path"]),
+            numstat=str(paths["numstat_path"]),
+            status=str(paths["status_path"]),
+            diff=str(paths["diff_path"]),
+            source_context=str(paths["source_context_path"]),
+            intent_context=str(paths["intent_context_path"]),
+            output=str(paths["output_path"]),
+            coverage_output=str(paths["coverage_path"]),
+            lookup_output=str(paths["lookup_context_path"]),
+            error_output=str(paths["output_path"].parent / "review-execution.json"),
+            max_prompt_bytes=2_000_000,
+        )
 
     def build_prompt(
         self,
@@ -294,9 +390,11 @@ class PromptPacketTests(unittest.TestCase):
         self.assertIn("BEGIN TRUSTED DEFAULT-BRANCH GUIDANCE: .review/chat.md", prompt)
         self.assertIn("BEGIN UNTRUSTED BASE..HEAD STATUS", prompt)
         self.assertIn("BEGIN UNTRUSTED BASE..HEAD DIFF", prompt)
+        self.assertIn("BEGIN UNTRUSTED EXACT-HEAD SOURCE", prompt)
+        self.assertIn("BEGIN UNTRUSTED EXACT-TICKET INTENT", prompt)
         self.assertIn(malicious_diff.strip(), prompt)
         self.assertIn(f"- Head SHA: {HEAD_SHA}", prompt)
-        self.assertIn("- Review scope: diff_v1", prompt)
+        self.assertIn(f"- Review scope: {contract.REVIEW_SCOPE}", prompt)
         self.assertEqual(coverage, persisted)
         self.assertTrue(coverage["complete"])
         self.assertFalse(coverage["truncated"])
@@ -325,23 +423,7 @@ class PromptPacketTests(unittest.TestCase):
                         contract.UntrustedMarkerCollisionError,
                         "UNTRUSTED_MARKER_COLLISION",
                     ):
-                        contract.command_build_prompt(
-                            Namespace(
-                                instructions=str(paths["instructions_path"]),
-                                trusted_context=str(paths["trusted_context"]),
-                                activated_packets=str(
-                                    paths["activated_packets_path"]
-                                ),
-                                review_input=str(paths["review_input_path"]),
-                                numstat=str(paths["numstat_path"]),
-                                status=str(paths["status_path"]),
-                                diff=str(paths["diff_path"]),
-                                output=str(paths["output_path"]),
-                                coverage_output=str(paths["coverage_path"]),
-                                error_output=str(error_output),
-                                max_prompt_bytes=2_000_000,
-                            )
-                        )
+                        contract.command_build_prompt(self.command_args(paths))
 
                     self.assertFalse(paths["output_path"].exists())
                     self.assertFalse(paths["coverage_path"].exists())
@@ -392,26 +474,38 @@ class PromptPacketTests(unittest.TestCase):
         )
         with temporary:
             with self.assertRaisesRegex(ValueError, "binary diff entries"):
-                contract.build_prompt(*paths.values())
+                contract.command_build_prompt(self.command_args(paths))
             self.assertFalse(paths["coverage_path"].exists())
             self.assertFalse(paths["output_path"].exists())
+            self.assertEqual(
+                json.loads((pathlib.Path(temporary.name) / "review-execution.json").read_text()),
+                {"status": "error", "code": "PREPARE_FAILED"},
+            )
 
     def test_non_utf8_diff_fails_before_coverage_is_written(self):
         temporary, paths = self.prompt_fixture(diff=b"valid prefix\n\xff\n")
         with temporary:
             with self.assertRaises(UnicodeDecodeError):
-                contract.build_prompt(*paths.values())
+                contract.command_build_prompt(self.command_args(paths))
             self.assertFalse(paths["coverage_path"].exists())
             self.assertFalse(paths["output_path"].exists())
+            self.assertEqual(
+                json.loads((pathlib.Path(temporary.name) / "review-execution.json").read_text()),
+                {"status": "error", "code": "PREPARE_FAILED"},
+            )
 
     def test_non_utf8_status_fails_before_coverage_is_written(self):
         temporary, paths = self.prompt_fixture(diff="+valid diff\n")
         with temporary:
             paths["status_path"].write_bytes(b"M\tinvalid-\xff-name\n")
             with self.assertRaises(UnicodeDecodeError):
-                contract.build_prompt(*paths.values())
+                contract.command_build_prompt(self.command_args(paths))
             self.assertFalse(paths["coverage_path"].exists())
             self.assertFalse(paths["output_path"].exists())
+            self.assertEqual(
+                json.loads((pathlib.Path(temporary.name) / "review-execution.json").read_text()),
+                {"status": "error", "code": "PREPARE_FAILED"},
+            )
 
 
 class FinalizeTests(unittest.TestCase):
@@ -420,9 +514,10 @@ class FinalizeTests(unittest.TestCase):
         model_output: object | None,
         *,
         execution: dict | None = None,
-        review_input: dict | None = None,
+        review_input_payload: dict | None = None,
         current: dict | None = None,
         coverage: dict | None = None,
+        lookup: object | None = None,
         packets: object | None = None,
         provenance: object | None = None,
     ):
@@ -432,6 +527,7 @@ class FinalizeTests(unittest.TestCase):
             execution_path = root / "execution.json"
             packets_path = root / "packets.json"
             coverage_path = root / "coverage.json"
+            lookup_path = root / "lookup.json"
             review_input_path = root / "review-input.json"
             current_path = root / "current.json"
             provenance_path = root / "provenance.json"
@@ -451,17 +547,9 @@ class FinalizeTests(unittest.TestCase):
             else:
                 packets_path.write_text(json.dumps(packet_payload))
             coverage_path.write_text(json.dumps(coverage or complete_coverage()))
+            lookup_path.write_text(json.dumps(lookup or lookup_context()))
             review_input_path.write_text(
-                json.dumps(
-                    review_input
-                    or {
-                        "head_sha": HEAD_SHA,
-                        "base_ref": "master",
-                        "base_sha": BASE_SHA,
-                        "state": "open",
-                        "review_scope": "diff_v1",
-                    }
-                )
+                json.dumps(review_input_payload or review_input())
             )
             current_path.write_text(
                 json.dumps(
@@ -489,6 +577,7 @@ class FinalizeTests(unittest.TestCase):
                 execution_path,
                 packets_path,
                 coverage_path,
+                lookup_path,
                 review_input_path,
                 current_path,
                 provenance_path,
@@ -503,7 +592,8 @@ class FinalizeTests(unittest.TestCase):
         self.assertEqual(result["base_ref"], "master")
         self.assertEqual(result["base_sha"], BASE_SHA)
         self.assertEqual(result["state"], "open")
-        self.assertEqual(result["review_scope"], "diff_v1")
+        self.assertEqual(result["review_scope"], contract.REVIEW_SCOPE)
+        self.assertTrue(result["lookup_context"]["complete"])
         self.assertTrue(result["coverage"]["complete"])
         self.assertEqual(result["workflow_revision"], WORKFLOW_SHA)
         self.assertEqual(result["activated_packets"], ["chat", "general"])
@@ -747,13 +837,9 @@ class FinalizeTests(unittest.TestCase):
     def test_side_branch_then_default_branch_then_retarget_chronology(self):
         side_branch, _ = self.finalize(
             clean_model(),
-            review_input={
-                "head_sha": HEAD_SHA,
-                "base_ref": "next",
-                "base_sha": BASE_SHA,
-                "state": "open",
-                "review_scope": "diff_v1",
-            },
+            review_input_payload=review_input(
+                base_ref="next",
+            ),
             current={
                 "lookup_success": True,
                 "state": "open",
