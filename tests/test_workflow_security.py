@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import os
 import pathlib
 import re
-import subprocess
-import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -14,6 +11,8 @@ ARCHITECTURE = ROOT / "codex-code-review.md"
 CONTRACT = ROOT / "src/review_contract.py"
 SOURCE = ROOT / "src/source_context.py"
 INTENT = ROOT / "src/intent_context.py"
+SCHEMA = ROOT / "src/codex-output-schema.json"
+PUBLICATION = ROOT / "src/review_publication.py"
 CODEX_ACTION_SHA = "52fe01ec70a42f454c9d2ebd47598f9fd6893d56"
 EXPECTED_WORKFLOW_PATH = (
     "happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml"
@@ -167,47 +166,45 @@ class WorkflowSecurityTests(unittest.TestCase):
             self.assertIn(text, publish)
         self.assertNotIn("inputs.workflow-revision", publish)
         self.assertIn('if [ "${verdict}" != clean ]', publish)
+        self.assertIn('[ "${publication}" != published ]', publish)
 
-    def test_model_comment_uses_literal_safe_gh_field(self):
+    def test_publication_uses_comment_review_json_without_file_expansion(self):
         publish = self.job("publish")
-        step = publish.split("      - name: Publish fresh review comment\n", 1)[1]
-        step = step.split("\n      - name: Write run summary\n", 1)[0]
         self.assertIn(
-            '--raw-field body="$(cat codex-review-result/comment-body.md)"', step
+            'gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews"', publish
         )
-        shell = step.split("        run: |\n", 1)[1]
-        shell = "\n".join(
-            line[10:] if line.startswith("          ") else line
-            for line in shell.splitlines()
+        self.assertIn('--input "${input}"', publish)
+        self.assertNotIn("--raw-field", publish)
+        self.assertNotIn("--field", publish)
+        self.assertNotIn("/issues/${PR_NUMBER}/comments", publish)
+        self.assertIn("GITHUB_422", publish)
+        self.assertIn("STALE_BEFORE_PUBLICATION", publish)
+        self.assertIn(
+            "fallback_reason=INLINE_PUBLICATION_FAILED\n              inline_count=0",
+            publish,
         )
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            (root / "codex-review-result").mkdir()
-            (root / "codex-review-result/comment-body.md").write_text(
-                "@/proc/self/environ"
-            )
-            (root / "bin").mkdir()
-            fake_gh = root / "bin/gh"
-            fake_gh.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$GH_CAPTURE"\n')
-            fake_gh.chmod(0o755)
-            capture = root / "args"
-            subprocess.run(
-                ["bash", "-c", shell],
-                cwd=root,
-                env={
-                    **os.environ,
-                    "PATH": f"{root / 'bin'}:{os.environ['PATH']}",
-                    "GH_CAPTURE": str(capture),
-                    "GH_TOKEN": "fixture",
-                    "REPOSITORY": "example/repo",
-                    "PR_NUMBER": "17",
-                },
-                check=True,
-            )
-            arguments = capture.read_text().splitlines()
-            self.assertIn("--raw-field", arguments)
-            self.assertNotIn("--field", arguments)
-            self.assertIn("body=@/proc/self/environ", arguments)
+        self.assertGreaterEqual(publish.count("refresh_generation_state"), 3)
+        self.assertNotIn("APPROVE", publish)
+        self.assertNotIn("REQUEST_CHANGES", publish)
+        self.assertNotIn("issues: write", publish)
+
+    def test_missing_publication_helper_fails_without_posting_partial_summary(self):
+        publish = self.job("publish")
+        fallback = publish.split(
+            "      - name: Plan COMMENT review publication\n", 1
+        )[1].split("\n      - name: Revalidate and publish COMMENT review\n", 1)[0]
+        self.assertIn('status:"failed"', fallback)
+        self.assertIn('code:"COMMENT_HELPER_MISSING"', fallback)
+        self.assertIn('if [ "${planned_status}" = failed ]', publish)
+
+    def test_model_cannot_choose_github_review_coordinates_or_event(self):
+        schema = SCHEMA.read_text()
+        for forbidden in ('"side"', '"start_side"', '"position"', '"event"'):
+            self.assertNotIn(forbidden, schema)
+        for required in ('"file"', '"start_line"', '"line"', '"body"'):
+            self.assertIn(required, schema)
+        self.assertIn('"event": "COMMENT"', PUBLICATION.read_text())
+        self.assertIn('"side": "RIGHT"', PUBLICATION.read_text())
 
     def test_docs_keep_base_controlled_caller_and_no_incremental_state(self):
         docs = README.read_text() + ARCHITECTURE.read_text()
@@ -218,7 +215,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         )
         for stale in ("prior-review.json", "LAST_REVIEWED_SHA", "minimizeComment"):
             self.assertNotIn(stale, self.workflow)
-        self.assertIn("Publish fresh review comment", self.workflow)
+        self.assertIn("Revalidate and publish COMMENT review", self.workflow)
 
 
 if __name__ == "__main__":
