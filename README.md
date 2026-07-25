@@ -52,6 +52,12 @@ Replace `WORKFLOW_COMMIT_SHA` with the immutable SHA. Keep the caller limited
 to invoking this reusable workflow; a `pull_request_target` caller must never
 check out or execute pull-request code.
 
+The workflow loads its trusted helper code from `job.workflow_repository` at
+the exact `job.workflow_sha`. This currently works without a separate checkout
+token because this repository is public. If the repository becomes private,
+the checkout requires an explicit least-privilege cross-repository token with
+contents read access or a different immutable packaging mechanism.
+
 Set `OPENAI_API_KEY` plus a read-only Linear OAuth client as consumer repository
 secrets. The Linear query is fixed to the exact ticket in the trusted PR-owner
 marker and validates the protected team key; it cannot switch teams or run an
