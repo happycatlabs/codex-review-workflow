@@ -220,7 +220,8 @@ Preparation and lookup failures are explicit and can never become clean:
 | `SOURCE_CONTEXT_FAILED`, `SOURCE_CONTEXT_TIMEOUT` | Trusted source lookup failed or timed out. |
 | `SOURCE_CONTEXT_STALE`, `SOURCE_CONTEXT_TRUNCATED` | Source binding or bounds are incomplete. |
 | `TICKET_CONTEXT_AUTH_MISSING`, `TICKET_CONTEXT_GRAPHQL_ERROR` | Protected read path is unavailable. |
-| `TICKET_CONTEXT_INVALID`, `TICKET_CONTEXT_MISSING` | Exact owner/ticket contract is malformed or absent. |
+| `TICKET_CONTEXT_INVALID` | Exact owner/ticket contract is malformed. |
+| `TICKET_CONTEXT_MISSING` | Exact owner/ticket context is absent. This is reported as a skipped review, not an infrastructure failure, while machine gates remain fail-closed. |
 | `TICKET_CONTEXT_STALE`, `TICKET_CONTEXT_TEAM_MISMATCH`, `TICKET_CONTEXT_TRUNCATED` | Intent is stale, outside the protected team, or incomplete. |
 | `UNTRUSTED_MARKER_COLLISION`, `INPUT_TRUNCATED`, `COVERAGE_INVALID` | Prompt boundaries or bounded coverage are unsafe. |
 | `MODEL_OUTPUT_MISSING`, `MODEL_OUTPUT_MALFORMED`, `MODEL_OUTPUT_INVALID`, `REVIEW_FAILED` | Review execution did not yield valid output. |

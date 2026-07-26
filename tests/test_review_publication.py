@@ -235,6 +235,22 @@ class PublicationPlanTests(unittest.TestCase):
         self.assertNotIn("commit_id", request)
         self.assertIn(f"Fingerprint: `{1:064x}`", request["body"])
 
+    def test_missing_ticket_context_is_published_as_one_review_skip(self):
+        code = "TICKET_CONTEXT_MISSING"
+        error = {
+            "code": code,
+            "reason": "This PR generation has no trusted task context.",
+        }
+        result, request, _ = publication.plan_publication(
+            result_fixture(error=error), comment_map()
+        )
+
+        self.assertEqual(result["publication"]["mode"], "summary")
+        self.assertEqual(request["body"].count(code), 1)
+        self.assertIn("Codex review skipped", request["body"])
+        self.assertIn("Automatic approval remains disabled", request["body"])
+        self.assertNotIn("infrastructure error", request["body"].lower())
+
     def test_mismatched_map_binding_falls_back(self):
         stale_map = comment_map()
         stale_map["head_sha"] = "f" * 40

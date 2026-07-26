@@ -660,6 +660,18 @@ class FinalizeTests(unittest.TestCase):
         self.assertIn("OPENAI_API_KEY", result["error"]["reason"])
         self.assertIn("AUTH_LEGACY_UNSAFE", comment)
 
+    def test_missing_ticket_context_is_an_expected_review_skip(self):
+        result, comment = self.finalize(
+            None,
+            execution={"status": "error", "code": "TICKET_CONTEXT_MISSING"},
+        )
+
+        self.assertEqual(result["verdict"], "error")
+        self.assertEqual(result["error"]["code"], "TICKET_CONTEXT_MISSING")
+        self.assertIn("Codex review skipped", comment)
+        self.assertIn("Automatic approval remains disabled", comment)
+        self.assertNotIn("infrastructure error", comment.lower())
+
     def test_missing_and_malformed_model_output_are_errors(self):
         missing, _ = self.finalize(None)
         malformed, _ = self.finalize("not-json")

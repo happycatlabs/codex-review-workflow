@@ -83,7 +83,7 @@ ERROR_REASONS = {
     "TICKET_CONTEXT_AUTH_MISSING": "Protected Linear read credentials are unavailable.",
     "TICKET_CONTEXT_GRAPHQL_ERROR": "The bounded Linear lookup failed.",
     "TICKET_CONTEXT_INVALID": "Linear returned malformed or mismatched ticket context.",
-    "TICKET_CONTEXT_MISSING": "No exact-generation trusted PR-owner ticket was available.",
+    "TICKET_CONTEXT_MISSING": "This PR generation has no trusted task context.",
     "TICKET_CONTEXT_STALE": "Ticket context is stale for this review generation.",
     "TICKET_CONTEXT_TEAM_MISMATCH": "The exact ticket is outside the protected Linear team.",
     "TICKET_CONTEXT_TRUNCATED": "Ticket intent exceeded its deterministic limit.",
@@ -634,13 +634,16 @@ def error_result(
     findings = result_findings(model_output)
     blocking = sum(1 for finding in findings if finding["blocking"])
     non_blocking = len(findings) - blocking
-    infrastructure_summary = (
-        f"Codex review infrastructure error (`{code}`): {reason}"
+    review_summary = (
+        f"Codex review skipped (`{code}`): {reason} "
+        "Automatic approval remains disabled."
+        if code == "TICKET_CONTEXT_MISSING"
+        else f"Codex review infrastructure error (`{code}`): {reason}"
     )
     summary = (
         model_output["comment_body"]
         if model_output is not None
-        else infrastructure_summary
+        else review_summary
     )
     result = {
         "schema_version": CONTRACT_VERSION,
@@ -666,7 +669,7 @@ def error_result(
             "inline_comment_count": 0,
         },
     }
-    return result, infrastructure_summary
+    return result, review_summary
 
 
 def finalize(
