@@ -94,6 +94,11 @@ Any model finding produces `blocking_findings` and fails the workflow in V1.
 The artifact retains `blocking_count` and `non_blocking_count` as metadata, but
 neither classification permits automatic passage yet.
 
+A pull request generation without trusted task context is an expected
+ineligible state, not an infrastructure failure. The review is reported as
+skipped and automatic approval remains disabled; all machine gates continue to
+fail closed.
+
 The publisher uploads `codex-review-result/codex-review-result.json`. A
 line-addressable finding becomes a resolvable inline thread only when its
 model-supplied file/range matches right-side added lines in the exact diff.

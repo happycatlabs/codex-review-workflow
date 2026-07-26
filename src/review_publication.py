@@ -172,18 +172,27 @@ def finding_location(finding: dict[str, Any]) -> str:
 def complete_review_body(
     result: dict[str, Any], fallback_reason: str | None
 ) -> str:
-    lines = [result["summary"].strip()]
     error = result.get("error")
+    if isinstance(error, dict) and error.get("code") == "TICKET_CONTEXT_MISSING":
+        lines = [
+            (
+                f"Codex review skipped (`{error['code']}`): "
+                f"{error['reason']} Automatic approval remains disabled."
+            )
+        ]
+    else:
+        lines = [result["summary"].strip()]
     if isinstance(error, dict):
-        lines.extend(
-            [
-                "",
-                (
-                    f"Review infrastructure error: `{error['code']}` — "
-                    f"{error['reason']}"
-                ),
-            ]
-        )
+        if error.get("code") != "TICKET_CONTEXT_MISSING":
+            lines.extend(
+                [
+                    "",
+                    (
+                        f"Review infrastructure error: `{error['code']}` — "
+                        f"{error['reason']}"
+                    ),
+                ]
+            )
     if fallback_reason:
         lines.extend(
             [
