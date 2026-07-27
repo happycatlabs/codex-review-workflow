@@ -46,9 +46,14 @@ root alias only, including deterministic iOS/native/index candidates. An
 unresolved source-shaped `@/` import fails closed. Trusted code does not execute
 or interpret `tsconfig.json`, package resolvers, or PR-controlled configuration.
 
-The exact diff uses external diff and text conversion disabled. Binary numstat
-entries and invalid UTF-8 fail preparation. Default-branch guidance is read by
-exact base SHA and separately delimited as trusted.
+The exact diff uses `--function-context --unified=20 --find-renames
+--no-ext-diff --no-textconv`. That byte recipe is part of the downstream
+identity contract: callers that compare `coverage.diff_sha256` must hash the
+same exact `BASE..HEAD` output and use compatible Git diff behavior for that
+recipe. A Git upgrade that changes function-context hunk selection must be
+validated across producer and consumer before rollout. Binary numstat entries
+and invalid UTF-8 fail preparation. Default-branch guidance is read by exact
+base SHA and separately delimited as trusted.
 
 ### 3. Resolve exact-ticket intent and seal prompt
 
