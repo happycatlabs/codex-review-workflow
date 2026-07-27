@@ -274,8 +274,8 @@ jobs:
               staging / "status.txt",
           )
           write_git_output(
-              ["diff", "--unified=20", "--find-renames", "--no-ext-diff",
-               "--no-textconv", base_sha, head_sha],
+              ["diff", "--function-context", "--unified=20", "--find-renames",
+               "--no-ext-diff", "--no-textconv", base_sha, head_sha],
               staging / "diff.patch",
           )
 

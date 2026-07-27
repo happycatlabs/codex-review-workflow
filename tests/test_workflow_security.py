@@ -156,7 +156,11 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("--no-ext-diff", self.workflow)
         self.assertIn("--no-textconv", self.workflow)
         self.assertIn('"--no-renames", "--no-ext-diff"', self.workflow)
-        self.assertNotIn('"--function-context"', self.workflow)
+        self.assertIn(
+            '["diff", "--function-context", "--unified=20", "--find-renames",\n'
+            '               "--no-ext-diff", "--no-textconv", base_sha, head_sha],',
+            self.workflow,
+        )
         self.assertIn("build-review-shards", self.workflow)
         self.assertIn("combine-review-shards", self.workflow)
         self.assertIn("strategy:\n      fail-fast: false\n      matrix:", self.workflow)
