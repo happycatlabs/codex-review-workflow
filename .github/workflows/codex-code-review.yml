@@ -274,8 +274,8 @@ jobs:
               staging / "status.txt",
           )
           write_git_output(
-              ["diff", "--function-context", "--unified=20", "--find-renames",
-               "--no-ext-diff", "--no-textconv", base_sha, head_sha],
+              ["diff", "--unified=20", "--find-renames", "--no-ext-diff",
+               "--no-textconv", base_sha, head_sha],
               staging / "diff.patch",
           )
 
@@ -356,6 +356,8 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
+    outputs:
+      review_matrix: ${{ steps.build-shards.outputs.review_matrix }}
     env:
       REVIEW_BUNDLE: codex-review-input
       MODEL_WORKSPACE: codex-review-input/model-workspace
@@ -401,13 +403,14 @@ jobs:
             --output "${METADATA_DIR}/intent-context.json" \
             --error-output "${REVIEW_BUNDLE}/review-execution.json"
 
-      - name: Build bounded prompt without credentials
+      - name: Build model-safe review partitions without credentials
+        id: build-shards
         run: |
           set -euo pipefail
           mkdir -p "${MODEL_WORKSPACE}"
           cp trusted-workflow/src/codex-output-schema.json \
             "${MODEL_WORKSPACE}/codex-output-schema.json"
-          python3 trusted-workflow/src/review_contract.py build-prompt \
+          python3 trusted-workflow/src/review_contract.py build-review-shards \
             --instructions trusted-workflow/src/review-instructions.md \
             --trusted-context "${TRUSTED_CONTEXT}" \
             --activated-packets "${METADATA_DIR}/activated-packets.json" \
@@ -417,25 +420,34 @@ jobs:
             --diff "${STAGING_DIR}/diff.patch" \
             --source-context "${METADATA_DIR}/source-context.json" \
             --intent-context "${METADATA_DIR}/intent-context.json" \
-            --output "${MODEL_WORKSPACE}/codex-prompt.md" \
+            --output-dir "${MODEL_WORKSPACE}/shards" \
+            --manifest-output "${METADATA_DIR}/review-shards.json" \
             --coverage-output "${METADATA_DIR}/coverage.json" \
             --lookup-output "${METADATA_DIR}/lookup-context.json" \
-            --error-output "${REVIEW_BUNDLE}/review-execution.json" \
-            --max-prompt-bytes 2000000
+            --error-output "${REVIEW_BUNDLE}/review-execution.json"
+          review_matrix=$(jq -c \
+            '{include:[.shards[] | {shard_id:.id}]}' \
+            "${METADATA_DIR}/review-shards.json")
+          echo "review_matrix=${review_matrix}" >> "${GITHUB_OUTPUT}"
           rm -rf "${STAGING_DIR}" "${TRUSTED_CONTEXT}"
 
       - name: Assert model filesystem contains generated files only
         run: |
           set -euo pipefail
           mapfile -t model_files < <(find "${MODEL_WORKSPACE}" -type f -print | sort)
-          expected=(
-            "${MODEL_WORKSPACE}/codex-output-schema.json"
-            "${MODEL_WORKSPACE}/codex-prompt.md"
-          )
-          if [ "${model_files[*]}" != "${expected[*]}" ]; then
+          expected_count=$((1 + $(jq -r '.shard_count' "${METADATA_DIR}/review-shards.json")))
+          if [ "${#model_files[@]}" -ne "${expected_count}" ] \
+              || [ "${model_files[0]}" != "${MODEL_WORKSPACE}/codex-output-schema.json" ]; then
             printf 'Unexpected model workspace files:\n%s\n' "${model_files[*]}" >&2
             exit 1
           fi
+          for shard_id in $(jq -r '.shards[].id' "${METADATA_DIR}/review-shards.json"); do
+            expected="${MODEL_WORKSPACE}/shards/${shard_id}/codex-prompt.md"
+            if ! printf '%s\n' "${model_files[@]}" | grep -Fxq "${expected}"; then
+              echo "Missing generated review partition ${shard_id}." >&2
+              exit 1
+            fi
+          done
 
       - name: Upload bounded review input
         if: ${{ always() }}
@@ -447,12 +459,15 @@ jobs:
           retention-days: 3
 
   review:
-    name: Run no-tools Codex source-context review
+    name: Run no-tools Codex source-context review (${{ matrix.shard_id }})
     needs: [trust-guard, prepare, intent]
     if: ${{ always() && needs.trust-guard.result == 'success' && needs.prepare.result == 'success' && needs.intent.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions: {}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.intent.outputs.review_matrix) }}
     steps:
       - name: Download bounded review input
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -484,6 +499,9 @@ jobs:
             echo "code=AUTH_MISSING" >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: Prepare partition output directory
+        run: mkdir -p codex-review-input/executions/${{ matrix.shard_id }}
+
       - name: Run Codex against generated prompt only
         id: run-codex
         if: ${{ steps.readiness.outputs.ready == 'true' }}
@@ -491,10 +509,10 @@ jobs:
         uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: codex-review-input/model-workspace/codex-prompt.md
-          output-file: codex-review-input/model-workspace/codex-output.json
+          prompt-file: codex-review-input/model-workspace/shards/${{ matrix.shard_id }}/codex-prompt.md
+          output-file: codex-review-input/executions/${{ matrix.shard_id }}/codex-output.json
           output-schema-file: codex-review-input/model-workspace/codex-output-schema.json
-          working-directory: codex-review-input/model-workspace
+          working-directory: codex-review-input/model-workspace/shards/${{ matrix.shard_id }}
           permission-profile: ':read-only'
           safety-strategy: drop-sudo
           codex-version: ${{ inputs.codex-cli-version }}
@@ -512,28 +530,45 @@ jobs:
           REVIEW_OUTCOME: ${{ steps.run-codex.outcome }}
         run: |
           set -euo pipefail
+          shard_id="${{ matrix.shard_id }}"
+          prompt="codex-review-input/model-workspace/shards/${shard_id}/codex-prompt.md"
+          execution_dir="codex-review-input/executions/${{ matrix.shard_id }}"
+          mkdir -p "${execution_dir}"
+          prompt_sha256=$(sha256sum "${prompt}" | awk '{print $1}')
+          prompt_bytes=$(wc -c < "${prompt}" | tr -d ' ')
           if [ "${READY}" != true ]; then
-            jq -n --arg code "${READINESS_CODE}" '{status:"error", code:$code}' \
-              > codex-review-input/review-execution.json
+            jq -n --arg code "${READINESS_CODE}" --arg shard_id "${shard_id}" \
+              --arg prompt_sha256 "${prompt_sha256}" --argjson prompt_bytes "${prompt_bytes}" \
+              '{status:"error",code:$code,shard_id:$shard_id,
+                prompt_sha256:$prompt_sha256,prompt_bytes:$prompt_bytes}' \
+              > "${execution_dir}/review-execution.json"
           elif [ "${REVIEW_OUTCOME}" != success ]; then
-            printf '{"status":"error","code":"REVIEW_FAILED"}\n' \
-              > codex-review-input/review-execution.json
-          elif [ ! -s codex-review-input/model-workspace/codex-output.json ]; then
-            printf '{"status":"error","code":"MODEL_OUTPUT_MISSING"}\n' \
-              > codex-review-input/review-execution.json
+            jq -n --arg shard_id "${shard_id}" --arg prompt_sha256 "${prompt_sha256}" \
+              --argjson prompt_bytes "${prompt_bytes}" \
+              '{status:"error",code:"REVIEW_FAILED",shard_id:$shard_id,
+                prompt_sha256:$prompt_sha256,prompt_bytes:$prompt_bytes}' \
+              > "${execution_dir}/review-execution.json"
+          elif [ ! -s "${execution_dir}/codex-output.json" ]; then
+            jq -n --arg shard_id "${shard_id}" --arg prompt_sha256 "${prompt_sha256}" \
+              --argjson prompt_bytes "${prompt_bytes}" \
+              '{status:"error",code:"MODEL_OUTPUT_MISSING",shard_id:$shard_id,
+                prompt_sha256:$prompt_sha256,prompt_bytes:$prompt_bytes}' \
+              > "${execution_dir}/review-execution.json"
           else
-            printf '{"status":"success"}\n' > codex-review-input/review-execution.json
+            jq -n --arg shard_id "${shard_id}" --arg prompt_sha256 "${prompt_sha256}" \
+              --argjson prompt_bytes "${prompt_bytes}" \
+              '{status:"success",shard_id:$shard_id,
+                prompt_sha256:$prompt_sha256,prompt_bytes:$prompt_bytes}' \
+              > "${execution_dir}/review-execution.json"
           fi
 
       - name: Upload raw review execution
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: codex-review-execution
-          path: |
-            codex-review-input/model-workspace/codex-output.json
-            codex-review-input/review-execution.json
-          if-no-files-found: warn
+          name: codex-review-execution-${{ matrix.shard_id }}
+          path: codex-review-input/executions
+          if-no-files-found: error
           retention-days: 3
 
   publish:
@@ -585,8 +620,9 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: codex-review-execution
-          path: codex-review-input
+          pattern: codex-review-execution-*
+          merge-multiple: true
+          path: codex-review-input/executions
 
       - name: Normalize missing preparation artifacts
         run: |
@@ -642,6 +678,19 @@ jobs:
               printf '{"status":"error","code":"REVIEW_FAILED"}\n' \
                 > codex-review-input/review-execution.json
             fi
+          fi
+
+      - name: Combine complete partition results
+        run: |
+          set -euo pipefail
+          helper=trusted-workflow/src/review_contract.py
+          if [ -s "${helper}" ] \
+              && [ -s codex-review-input/metadata/review-shards.json ]; then
+            python3 "${helper}" combine-review-shards \
+              --manifest codex-review-input/metadata/review-shards.json \
+              --executions codex-review-input/executions \
+              --model-output codex-review-input/model-workspace/codex-output.json \
+              --execution-output codex-review-input/review-execution.json
           fi
 
       - name: Refetch current pull request and default branch

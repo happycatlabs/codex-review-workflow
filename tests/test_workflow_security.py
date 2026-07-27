@@ -111,8 +111,12 @@ class WorkflowSecurityTests(unittest.TestCase):
         review = self.job("review", "publish")
         self.assertIn("Assert model filesystem contains generated files only", intent)
         self.assertIn('"${MODEL_WORKSPACE}/codex-output-schema.json"', intent)
-        self.assertIn('"${MODEL_WORKSPACE}/codex-prompt.md"', intent)
-        self.assertIn("working-directory: codex-review-input/model-workspace", review)
+        self.assertIn('"${MODEL_WORKSPACE}/shards/${shard_id}/codex-prompt.md"', intent)
+        self.assertIn(
+            "working-directory: codex-review-input/model-workspace/shards/"
+            "${{ matrix.shard_id }}",
+            review,
+        )
         self.assertIn("permissions: {}", review)
         self.assertIn(f"uses: openai/codex-action@{CODEX_ACTION_SHA}", review)
         self.assertIn("permission-profile: ':read-only'", review)
@@ -130,6 +134,8 @@ class WorkflowSecurityTests(unittest.TestCase):
         source = SOURCE.read_text()
         for text in (
             "MAX_PROMPT_BYTES = 2_000_000",
+            "MAX_MODEL_PROMPT_BYTES = 900_000",
+            "MAX_REVIEW_SHARDS = 16",
             "UNTRUSTED_MARKER_COLLISION",
             "INPUT_TRUNCATED",
             "SOURCE_CONTEXT_TRUNCATED",
@@ -150,6 +156,10 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("--no-ext-diff", self.workflow)
         self.assertIn("--no-textconv", self.workflow)
         self.assertIn('"--no-renames", "--no-ext-diff"', self.workflow)
+        self.assertNotIn('"--function-context"', self.workflow)
+        self.assertIn("build-review-shards", self.workflow)
+        self.assertIn("combine-review-shards", self.workflow)
+        self.assertIn("strategy:\n      fail-fast: false\n      matrix:", self.workflow)
         self.assertIn("--lookup-context", self.workflow)
 
     def test_publisher_refetches_identity_and_proves_workflow_revision(self):

@@ -92,6 +92,11 @@ bounded packet; it is not whole-repository or feature correctness proof.
 The source packet is capped at 75 files and 750,000 total bytes, with a
 100,000-byte per-file limit. Any overflow fails closed as
 `SOURCE_CONTEXT_TRUNCATED`; the workflow never silently drops source files.
+The complete logical packet may be up to 2,000,000 bytes. When it exceeds the
+900,000-byte model-call limit, trusted code deterministically partitions the
+diff and source context, runs every required no-tools review, and combines the
+validated findings. One missing or failed partition fails the whole review;
+partitioning never turns incomplete coverage into a clean result.
 
 Any model finding produces `blocking_findings` and fails the workflow in V1.
 The artifact retains `blocking_count` and `non_blocking_count` as metadata, but
