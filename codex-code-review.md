@@ -66,17 +66,23 @@ are never written to artifacts.
 
 After the credential-bearing step ends, a separate no-secret step validates and
 hashes source and intent manifests, rejects reserved-boundary injection, and
-builds the bounded prompt. Ticket text, source, status, and diff are all
+builds the bounded logical packet. Ticket text, source, status, and diff are all
 delimited as untrusted evidence.
 
-The prompt cap is 2,000,000 bytes. Any truncation prevents Codex from running
-and returns `INPUT_TRUNCATED`.
+The complete logical packet cap is 2,000,000 bytes. Any truncation prevents
+Codex from running and returns `INPUT_TRUNCATED`. A packet above the
+900,000-byte per-call ceiling is deterministically split into diff and source
+groups. Trusted code chooses the lowest-call complete grouping, records every
+prompt hash and byte count, and never splits an individual file diff or source
+file. Each source group is reviewed against each required diff group so no
+source/diff relationship is silently skipped.
 
 ### 4. No-tools Codex
 
-The review job has no checkout and no Linear credential. Its working directory
-contains only the generated prompt, JSON output schema, and eventual structured
-output. The pinned action receives:
+The review job has no checkout and no Linear credential. A matrix runs one
+model call per generated partition. Each model working directory contains only
+its generated prompt; the JSON output schema and eventual structured output
+remain generated workflow files. The pinned action receives:
 
 ```json
 ["--ephemeral", "--disable", "shell_tool", "--disable", "unified_exec"]
@@ -85,6 +91,11 @@ output. The pinned action receives:
 It also uses `permission-profile: :read-only` and `safety-strategy: drop-sudo`.
 The model receives no shell, process, network, credential, patch, approval,
 merge, deployment, or external-write capability and cannot request more source.
+Each output is validated independently. Trusted aggregation deduplicates exact
+finding fingerprints and emits the existing result contract only after every
+expected partition succeeds. A missing, malformed, mismatched, or failed
+partition makes the whole review an error while preserving any concrete
+findings already returned by successful partitions.
 
 ### 5. Trusted publish
 
@@ -194,9 +205,11 @@ Artifact: `codex-review-result/codex-review-result.json`
 
 Source and intent manifests also contain bounded counts and SHA-256 hashes. A
 `clean` result requires complete manifests, complete coverage, exact current
-generation identity, supported revisions, valid model output, and zero model
-findings. Any finding produces `blocking_findings`, including a non-blocking
-`RISK`.
+generation identity, supported revisions, successful receipt-bound execution of
+every generated partition, valid model output, and zero model findings. The
+short-lived input artifact also contains `review-shards.json` with logical
+packet identity, partition assignments, prompt hashes, and byte counts. Any
+finding produces `blocking_findings`, including a non-blocking `RISK`.
 
 Downstream consumers must independently require:
 

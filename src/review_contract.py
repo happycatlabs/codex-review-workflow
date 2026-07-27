@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -28,6 +29,9 @@ from source_context import (
 CONTRACT_VERSION = "codex-review-result/v3"
 REVIEW_SCOPE = "source_context_v1"
 MAX_PROMPT_BYTES = 2_000_000
+MAX_MODEL_PROMPT_BYTES = 900_000
+MAX_REVIEW_SHARDS = 16
+REVIEW_SHARD_SCHEMA = "codex-review-shards/v1"
 MAX_FINDINGS = 25
 MAX_COMMENT_BODY_CHARS = 4_000
 MAX_FINDING_BODY_CHARS = 1_000
@@ -253,6 +257,10 @@ class UntrustedMarkerCollisionError(ValueError):
     pass
 
 
+class ReviewInputTruncatedError(ValueError):
+    pass
+
+
 def reject_untrusted_marker_collisions(*values: str) -> None:
     if any(marker in value for value in values for marker in ("<<<BEGIN", "<<<END")):
         raise UntrustedMarkerCollisionError("UNTRUSTED_MARKER_COLLISION")
@@ -386,6 +394,480 @@ def build_prompt(
         encoding="utf-8",
     )
     return coverage
+
+
+def _split_diff_blocks(diff: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current:
+                blocks.append("".join(current))
+            current = [line]
+        else:
+            if not current and line.strip():
+                raise ValueError("diff contains data before its first file boundary")
+            current.append(line)
+    if current:
+        blocks.append("".join(current))
+    return blocks or [""]
+
+
+def _source_entry_rendered_bytes(entry: dict[str, Any]) -> int:
+    content = entry["content"]
+    separator = "" if content.endswith("\n") else "\n"
+    roles = ",".join(sorted(set(entry["roles"])))
+    rendered = (
+        f"<<<BEGIN UNTRUSTED EXACT-HEAD SOURCE path={entry['path']} roles={roles}>>>\n"
+        f"{content}{separator}"
+        f"<<<END UNTRUSTED EXACT-HEAD SOURCE path={entry['path']}>>>"
+    )
+    return len(rendered.encode())
+
+
+def _partition_units(
+    units: list[Any], max_bytes: int, size: Any, separator_bytes: int = 2
+) -> list[list[Any]]:
+    if not units:
+        return [[]]
+    if max_bytes <= 0:
+        raise ValueError("review partition budget is exhausted")
+    indexed_units = [
+        (index, unit, size(unit)) for index, unit in enumerate(units)
+    ]
+    groups: list[tuple[int, list[tuple[int, Any]]]] = []
+    for index, unit, unit_bytes in sorted(
+        indexed_units, key=lambda item: (-item[2], item[0])
+    ):
+        if unit_bytes > max_bytes:
+            raise ValueError("one review unit exceeds the model-safe partition budget")
+        for group_index, (group_bytes, members) in enumerate(groups):
+            if group_bytes + separator_bytes + unit_bytes <= max_bytes:
+                groups[group_index] = (
+                    group_bytes + separator_bytes + unit_bytes,
+                    [*members, (index, unit)],
+                )
+                break
+        else:
+            groups.append((unit_bytes, [(index, unit)]))
+    return [
+        [unit for _, unit in sorted(members)]
+        for _, members in sorted(
+            groups,
+            key=lambda group: min(index for index, _ in group[1]),
+        )
+    ] or [[]]
+
+
+def _best_partition_plan(
+    diff_units: list[str],
+    source_units: list[dict[str, Any]],
+    available_bytes: int,
+) -> tuple[list[list[str]], list[list[dict[str, Any]]]]:
+    diff_size = lambda block: len(block.encode())
+    source_size = _source_entry_rendered_bytes
+    total_diff = sum(diff_size(unit) for unit in diff_units)
+    total_source = sum(source_size(unit) for unit in source_units) + max(
+        0, len(source_units) - 1
+    ) * 2
+    max_diff = max((diff_size(unit) for unit in diff_units), default=0)
+    max_source = max((source_size(unit) for unit in source_units), default=0)
+    candidate_budgets = {
+        (available_bytes // 2, available_bytes - available_bytes // 2),
+        (total_diff, available_bytes - total_diff),
+        (available_bytes - total_source, total_source),
+        (max_diff, available_bytes - max_diff),
+        (available_bytes - max_source, max_source),
+    }
+    candidates = []
+    for diff_budget, source_budget in sorted(candidate_budgets):
+        if diff_budget < max_diff or source_budget < max_source:
+            continue
+        try:
+            diff_groups = _partition_units(
+                diff_units, diff_budget, diff_size, separator_bytes=0
+            )
+            source_groups = _partition_units(
+                source_units, source_budget, source_size
+            )
+        except ValueError:
+            continue
+        shard_count = len(diff_groups) * len(source_groups)
+        duplicated_bytes = (
+            len(source_groups) * total_diff + len(diff_groups) * total_source
+        )
+        candidates.append(
+            (shard_count, duplicated_bytes, diff_groups, source_groups)
+        )
+    if not candidates:
+        raise ValueError("review packet cannot be partitioned within the model limit")
+    _, _, diff_groups, source_groups = min(
+        candidates, key=lambda candidate: (candidate[0], candidate[1])
+    )
+    return diff_groups, source_groups
+
+
+def _source_subset(
+    source_data: dict[str, Any], entries: list[dict[str, Any]]
+) -> dict[str, Any]:
+    canonical = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+    bytes_included = sum(len(entry["content"].encode()) for entry in entries)
+    manifest = {
+        **source_data["manifest"],
+        "files_included": len(entries),
+        "bytes_included": bytes_included,
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+    return {"manifest": manifest, "entries": entries}
+
+
+def build_review_shards(
+    instructions_path: pathlib.Path,
+    trusted_context: pathlib.Path,
+    activated_packets_path: pathlib.Path,
+    review_input_path: pathlib.Path,
+    numstat_path: pathlib.Path,
+    status_path: pathlib.Path,
+    diff_path: pathlib.Path,
+    source_context_path: pathlib.Path,
+    intent_context_path: pathlib.Path,
+    output_dir: pathlib.Path,
+    manifest_path: pathlib.Path,
+    coverage_path: pathlib.Path,
+    lookup_context_path: pathlib.Path,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = pathlib.Path(temporary_directory)
+        logical_prompt = temporary / "logical-prompt.md"
+        logical_coverage = build_prompt(
+            instructions_path,
+            trusted_context,
+            activated_packets_path,
+            review_input_path,
+            numstat_path,
+            status_path,
+            diff_path,
+            source_context_path,
+            intent_context_path,
+            logical_prompt,
+            coverage_path,
+            lookup_context_path,
+            MAX_PROMPT_BYTES,
+        )
+        if not logical_coverage["complete"]:
+            raise ReviewInputTruncatedError(
+                "logical review packet exceeds its complete coverage limit"
+            )
+
+        logical_prompt_bytes = logical_prompt.read_bytes()
+        logical_prompt_sha = hashlib.sha256(logical_prompt_bytes).hexdigest()
+        shard_records: list[dict[str, Any]] = []
+        if len(logical_prompt_bytes) <= MAX_MODEL_PROMPT_BYTES:
+            source_data = json.loads(
+                source_context_path.read_text(encoding="utf-8", errors="strict")
+            )
+            shard_id = "000"
+            destination = output_dir / shard_id / "codex-prompt.md"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(logical_prompt, destination)
+            shard_records.append(
+                {
+                    "id": shard_id,
+                    "prompt_bytes": len(logical_prompt_bytes),
+                    "prompt_sha256": logical_prompt_sha,
+                    "diff_group": 0,
+                    "diff_bytes": logical_coverage["diff_bytes_original"],
+                    "diff_sha256": logical_coverage["diff_sha256"],
+                    "source_group": 0,
+                    "source_context_bytes": logical_coverage["source_context_bytes"],
+                    "source_paths": [
+                        entry["path"] for entry in source_data["entries"]
+                    ],
+                }
+            )
+        else:
+            review_input, review_input_valid = load_review_input(review_input_path)
+            if not review_input_valid:
+                raise ValueError("review input is invalid")
+            _, source_text, source_raw = load_source_context(
+                source_context_path, review_input
+            )
+            source_data = json.loads(source_raw)
+            diff = diff_path.read_text(encoding="utf-8", errors="strict")
+            base_bytes = (
+                len(logical_prompt_bytes)
+                - len(diff.encode())
+                - len(source_text.encode())
+            )
+            available_bytes = MAX_MODEL_PROMPT_BYTES - base_bytes - 8_000
+            diff_groups, source_groups = _best_partition_plan(
+                _split_diff_blocks(diff),
+                source_data["entries"],
+                available_bytes,
+            )
+            shard_count = len(diff_groups) * len(source_groups)
+            if shard_count > MAX_REVIEW_SHARDS:
+                raise ValueError("review packet requires too many model partitions")
+
+            for diff_index, diff_group in enumerate(diff_groups):
+                diff_text = "".join(diff_group)
+                diff_bytes = diff_text.encode()
+                for source_index, source_group in enumerate(source_groups):
+                    shard_id = f"{len(shard_records):03d}"
+                    shard_root = output_dir / shard_id
+                    shard_root.mkdir(parents=True, exist_ok=True)
+                    shard_source = temporary / f"source-{shard_id}.json"
+                    shard_diff = temporary / f"diff-{shard_id}.patch"
+                    shard_instructions = temporary / f"instructions-{shard_id}.md"
+                    shard_coverage = temporary / f"coverage-{shard_id}.json"
+                    shard_lookup = temporary / f"lookup-{shard_id}.json"
+                    shard_source.write_text(
+                        json.dumps(_source_subset(source_data, source_group), indent=2)
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    shard_diff.write_text(diff_text, encoding="utf-8")
+                    shard_instructions.write_text(
+                        instructions_path.read_text(
+                            encoding="utf-8", errors="strict"
+                        ).rstrip()
+                        + "\n\n"
+                        + (
+                            f"# Review partition\n\nThis is partition "
+                            f"{len(shard_records) + 1} of {shard_count}. "
+                            "Return findings only for the supplied diff partition. "
+                            "A NO_ISSUES result applies only to this partition; trusted "
+                            "aggregation determines the whole pull request result.\n"
+                        ),
+                        encoding="utf-8",
+                    )
+                    shard_result = build_prompt(
+                        shard_instructions,
+                        trusted_context,
+                        activated_packets_path,
+                        review_input_path,
+                        numstat_path,
+                        status_path,
+                        shard_diff,
+                        shard_source,
+                        intent_context_path,
+                        shard_root / "codex-prompt.md",
+                        shard_coverage,
+                        shard_lookup,
+                        MAX_MODEL_PROMPT_BYTES,
+                    )
+                    if not shard_result["complete"]:
+                        raise ValueError("generated model partition is incomplete")
+                    prompt_bytes = (shard_root / "codex-prompt.md").read_bytes()
+                    shard_records.append(
+                        {
+                            "id": shard_id,
+                            "prompt_bytes": len(prompt_bytes),
+                            "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+                            "diff_group": diff_index,
+                            "diff_bytes": len(diff_bytes),
+                            "diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+                            "source_group": source_index,
+                            "source_context_bytes": sum(
+                                len(entry["content"].encode())
+                                for entry in source_group
+                            ),
+                            "source_paths": [entry["path"] for entry in source_group],
+                        }
+                    )
+
+        manifest = {
+            "schema_version": REVIEW_SHARD_SCHEMA,
+            "complete": True,
+            "prompt_limit_bytes": MAX_MODEL_PROMPT_BYTES,
+            "logical_prompt_bytes": len(logical_prompt_bytes),
+            "logical_prompt_sha256": logical_prompt_sha,
+            "shard_count": len(shard_records),
+            "shards": shard_records,
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return manifest
+
+
+def combine_review_shards(
+    manifest_path: pathlib.Path,
+    executions_dir: pathlib.Path,
+    model_output_path: pathlib.Path,
+    execution_path: pathlib.Path,
+) -> None:
+    try:
+        manifest = load_json(manifest_path)
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):
+        manifest = None
+    valid_manifest = (
+        isinstance(manifest, dict)
+        and set(manifest)
+        == {
+            "schema_version",
+            "complete",
+            "prompt_limit_bytes",
+            "logical_prompt_bytes",
+            "logical_prompt_sha256",
+            "shard_count",
+            "shards",
+        }
+        and manifest.get("schema_version") == REVIEW_SHARD_SCHEMA
+        and manifest.get("complete") is True
+        and manifest.get("prompt_limit_bytes") == MAX_MODEL_PROMPT_BYTES
+        and type(manifest.get("shard_count")) is int
+        and 0 < manifest["shard_count"] <= MAX_REVIEW_SHARDS
+        and isinstance(manifest.get("shards"), list)
+        and len(manifest["shards"]) == manifest["shard_count"]
+    )
+    if valid_manifest:
+        expected_ids = [f"{index:03d}" for index in range(manifest["shard_count"])]
+        valid_manifest = (
+            type(manifest.get("logical_prompt_bytes")) is int
+            and manifest["logical_prompt_bytes"] > 0
+            and isinstance(manifest.get("logical_prompt_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", manifest["logical_prompt_sha256"])
+            is not None
+            and [
+                shard.get("id") if isinstance(shard, dict) else None
+                for shard in manifest["shards"]
+            ]
+            == expected_ids
+            and all(
+                isinstance(shard, dict)
+                and set(shard)
+                == {
+                    "id",
+                    "prompt_bytes",
+                    "prompt_sha256",
+                    "diff_group",
+                    "diff_bytes",
+                    "diff_sha256",
+                    "source_group",
+                    "source_context_bytes",
+                    "source_paths",
+                }
+                and type(shard["prompt_bytes"]) is int
+                and 0 < shard["prompt_bytes"] <= MAX_MODEL_PROMPT_BYTES
+                and isinstance(shard["prompt_sha256"], str)
+                and re.fullmatch(r"[0-9a-f]{64}", shard["prompt_sha256"])
+                is not None
+                and type(shard["diff_group"]) is int
+                and shard["diff_group"] >= 0
+                and type(shard["diff_bytes"]) is int
+                and shard["diff_bytes"] >= 0
+                and isinstance(shard["diff_sha256"], str)
+                and re.fullmatch(r"[0-9a-f]{64}", shard["diff_sha256"])
+                is not None
+                and type(shard["source_group"]) is int
+                and shard["source_group"] >= 0
+                and type(shard["source_context_bytes"]) is int
+                and shard["source_context_bytes"] >= 0
+                and isinstance(shard["source_paths"], list)
+                and all(
+                    isinstance(path, str) and path
+                    for path in shard["source_paths"]
+                )
+                for shard in manifest["shards"]
+            )
+        )
+    if not valid_manifest:
+        write_execution_error(execution_path, "REVIEW_FAILED")
+        model_output_path.unlink(missing_ok=True)
+        return
+
+    failure_codes: list[str] = []
+    model_summaries: list[str] = []
+    findings_by_fingerprint: dict[str, dict[str, Any]] = {}
+    for expected_index, shard in enumerate(manifest["shards"]):
+        shard_id = f"{expected_index:03d}"
+        if not isinstance(shard, dict) or shard.get("id") != shard_id:
+            failure_codes.append("REVIEW_FAILED")
+            continue
+        shard_root = executions_dir / shard_id
+        try:
+            execution = load_json(shard_root / "review-execution.json")
+        except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):
+            execution = None
+        if not isinstance(execution, dict):
+            failure_codes.append("REVIEW_FAILED")
+            continue
+        if (
+            execution.get("shard_id") != shard_id
+            or execution.get("prompt_sha256") != shard.get("prompt_sha256")
+            or execution.get("prompt_bytes") != shard.get("prompt_bytes")
+        ):
+            failure_codes.append("REVIEW_FAILED")
+            continue
+        if execution.get("status") != "success":
+            code = execution.get("code")
+            failure_codes.append(
+                code if code in ERROR_REASONS else "REVIEW_FAILED"
+            )
+            continue
+        try:
+            raw_output = load_json(shard_root / "codex-output.json")
+        except FileNotFoundError:
+            failure_codes.append("MODEL_OUTPUT_MISSING")
+            continue
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            failure_codes.append("MODEL_OUTPUT_MALFORMED")
+            continue
+        try:
+            output = validate_model_output(raw_output)
+        except ValueError:
+            failure_codes.append("MODEL_OUTPUT_INVALID")
+            continue
+        model_summaries.append(output["comment_body"])
+        for finding in output["findings"]:
+            findings_by_fingerprint.setdefault(finding_fingerprint(finding), finding)
+
+    findings = list(findings_by_fingerprint.values())
+    findings_overflow = len(findings) > MAX_FINDINGS
+    if findings_overflow:
+        failure_codes.append("MODEL_OUTPUT_INVALID")
+        findings = findings[:MAX_FINDINGS]
+    shard_count = manifest["shard_count"]
+    partition_word = "partition" if shard_count == 1 else "partitions"
+    if findings_overflow:
+        summary = (
+            f"Codex review exceeded the {MAX_FINDINGS}-finding result limit across "
+            f"{shard_count} {partition_word}. The first {len(findings)} concrete "
+            "findings were preserved."
+        )
+    elif failure_codes:
+        summary = (
+            f"Codex review was incomplete across {shard_count} {partition_word}. "
+            f"{len(findings)} concrete finding(s) were preserved from completed work."
+        )
+    elif shard_count == 1:
+        summary = model_summaries[0]
+    elif findings:
+        summary = (
+            f"Codex reviewed all {shard_count} {partition_word} and found "
+            f"{len(findings)} concrete issue(s)."
+        )
+    else:
+        summary = (
+            f"Codex reviewed all {shard_count} {partition_word} and found no issues."
+        )
+    combined = {
+        "result": "HAS_FINDINGS" if findings else "NO_ISSUES",
+        "comment_body": summary,
+        "findings": findings,
+    }
+    model_output_path.parent.mkdir(parents=True, exist_ok=True)
+    model_output_path.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8")
+    if failure_codes:
+        unique_failure_codes = set(failure_codes)
+        selected_code = (
+            failure_codes[0]
+            if len(unique_failure_codes) == 1
+            else "REVIEW_FAILED"
+        )
+        write_execution_error(execution_path, selected_code)
+    else:
+        execution_path.write_text('{"status":"success"}\n', encoding="utf-8")
 
 
 def normalized_text(value: str) -> str:
@@ -882,6 +1364,16 @@ def write_execution_error(path: pathlib.Path, code: str) -> None:
     )
 
 
+def prompt_preparation_error_code(error: Exception) -> str:
+    if isinstance(error, ReviewInputTruncatedError):
+        return "INPUT_TRUNCATED"
+    if isinstance(error, UntrustedMarkerCollisionError):
+        return "UNTRUSTED_MARKER_COLLISION"
+    if isinstance(error, (IntentContextError, SourceContextError)):
+        return error.code
+    return "PREPARE_FAILED"
+
+
 def command_build_source_context(args: argparse.Namespace) -> None:
     review_input, valid = load_review_input(pathlib.Path(args.review_input))
     if not valid:
@@ -958,6 +1450,7 @@ def command_build_prompt(args: argparse.Namespace) -> None:
     except (
         IntentContextError,
         OSError,
+        ReviewInputTruncatedError,
         SourceContextError,
         UntrustedMarkerCollisionError,
         ValueError,
@@ -965,14 +1458,58 @@ def command_build_prompt(args: argparse.Namespace) -> None:
         output_path.unlink(missing_ok=True)
         coverage_path.unlink(missing_ok=True)
         lookup_path.unlink(missing_ok=True)
-        if isinstance(error, UntrustedMarkerCollisionError):
-            code = "UNTRUSTED_MARKER_COLLISION"
-        elif isinstance(error, (IntentContextError, SourceContextError)):
-            code = error.code
-        else:
-            code = "PREPARE_FAILED"
+        code = prompt_preparation_error_code(error)
         write_execution_error(pathlib.Path(args.error_output), code)
         raise
+
+
+def command_build_review_shards(args: argparse.Namespace) -> None:
+    output_dir = pathlib.Path(args.output_dir)
+    manifest_path = pathlib.Path(args.manifest_output)
+    coverage_path = pathlib.Path(args.coverage_output)
+    lookup_path = pathlib.Path(args.lookup_output)
+    try:
+        build_review_shards(
+            pathlib.Path(args.instructions),
+            pathlib.Path(args.trusted_context),
+            pathlib.Path(args.activated_packets),
+            pathlib.Path(args.review_input),
+            pathlib.Path(args.numstat),
+            pathlib.Path(args.status),
+            pathlib.Path(args.diff),
+            pathlib.Path(args.source_context),
+            pathlib.Path(args.intent_context),
+            output_dir,
+            manifest_path,
+            coverage_path,
+            lookup_path,
+        )
+    except (
+        IntentContextError,
+        OSError,
+        SourceContextError,
+        UntrustedMarkerCollisionError,
+        ValueError,
+    ) as error:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        manifest_path.unlink(missing_ok=True)
+        if not isinstance(error, ReviewInputTruncatedError):
+            coverage_path.unlink(missing_ok=True)
+            lookup_path.unlink(missing_ok=True)
+        write_execution_error(
+            pathlib.Path(args.error_output),
+            prompt_preparation_error_code(error),
+        )
+        raise
+
+
+def command_combine_review_shards(args: argparse.Namespace) -> None:
+    combine_review_shards(
+        pathlib.Path(args.manifest),
+        pathlib.Path(args.executions),
+        pathlib.Path(args.model_output),
+        pathlib.Path(args.execution_output),
+    )
 
 
 def command_finalize(args: argparse.Namespace) -> None:
@@ -1042,6 +1579,28 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--error-output", required=True)
     build.add_argument("--max-prompt-bytes", type=int, default=MAX_PROMPT_BYTES)
     build.set_defaults(handler=command_build_prompt)
+    shards = commands.add_parser("build-review-shards")
+    shards.add_argument("--instructions", required=True)
+    shards.add_argument("--trusted-context", required=True)
+    shards.add_argument("--activated-packets", required=True)
+    shards.add_argument("--review-input", required=True)
+    shards.add_argument("--numstat", required=True)
+    shards.add_argument("--status", required=True)
+    shards.add_argument("--diff", required=True)
+    shards.add_argument("--source-context", required=True)
+    shards.add_argument("--intent-context", required=True)
+    shards.add_argument("--output-dir", required=True)
+    shards.add_argument("--manifest-output", required=True)
+    shards.add_argument("--coverage-output", required=True)
+    shards.add_argument("--lookup-output", required=True)
+    shards.add_argument("--error-output", required=True)
+    shards.set_defaults(handler=command_build_review_shards)
+    combine = commands.add_parser("combine-review-shards")
+    combine.add_argument("--manifest", required=True)
+    combine.add_argument("--executions", required=True)
+    combine.add_argument("--model-output", required=True)
+    combine.add_argument("--execution-output", required=True)
+    combine.set_defaults(handler=command_combine_review_shards)
     final = commands.add_parser("finalize")
     final.add_argument("--model-output", required=True)
     final.add_argument("--execution", required=True)
