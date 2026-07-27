@@ -180,6 +180,47 @@ class SourceContextTests(unittest.TestCase):
         with self.assertRaises(source_context.SourceContextStaleError):
             source_context.load_source_context(output, stale)
 
+    def test_default_file_limit_accepts_wider_graph_and_rejects_overflow(self):
+        self.repository.write("lib/changed.ts", "export const changed = 1;\n")
+        for index in range(source_context.MAX_CONTEXT_FILES - 1):
+            self.repository.write(
+                f"hooks/caller-{index:02d}.ts",
+                'import "@/lib/changed";\n'
+                f"export const caller{index:02d} = {index};\n",
+            )
+        self.repository.commit()
+
+        result = self.build(["lib/changed.ts"])
+        self.assertEqual(
+            result["manifest"]["files_included"],
+            source_context.MAX_CONTEXT_FILES,
+        )
+
+        overflow_index = source_context.MAX_CONTEXT_FILES - 1
+        self.repository.write(
+            f"hooks/caller-{overflow_index:02d}.ts",
+            'import "@/lib/changed";\n'
+            f"export const caller{overflow_index:02d} = {overflow_index};\n",
+        )
+        self.repository.commit()
+
+        with self.assertRaisesRegex(
+            source_context.SourceContextTruncatedError,
+            "source context file limit exceeded",
+        ):
+            self.build(["lib/changed.ts"])
+
+    def test_context_byte_limit_remains_fail_closed(self):
+        self.repository.write("lib/changed.ts", "export const changed = 1;\n")
+        self.repository.commit()
+
+        with mock.patch.object(source_context, "MAX_CONTEXT_BYTES", 1):
+            with self.assertRaisesRegex(
+                source_context.SourceContextTruncatedError,
+                "source context byte limit exceeded",
+            ):
+                self.build(["lib/changed.ts"])
+
     def test_scan_limit_rejects_blob_before_reading_it(self):
         self.repository.write("lib/large.ts", "export const large = '" + "x" * 100 + "';\n")
         self.repository.commit()

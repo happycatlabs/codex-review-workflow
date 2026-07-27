@@ -89,6 +89,9 @@ bounded diff, exact-ticket intent, and exact-head source for eligible changed
 files plus unchanged direct callers and dependencies. The model cannot browse
 or request more files. A `clean` verdict means zero findings in that complete
 bounded packet; it is not whole-repository or feature correctness proof.
+The source packet is capped at 75 files and 750,000 total bytes, with a
+100,000-byte per-file limit. Any overflow fails closed as
+`SOURCE_CONTEXT_TRUNCATED`; the workflow never silently drops source files.
 
 Any model finding produces `blocking_findings` and fails the workflow in V1.
 The artifact retains `blocking_count` and `non_blocking_count` as metadata, but
