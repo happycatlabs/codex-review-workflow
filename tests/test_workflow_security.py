@@ -120,7 +120,11 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("permissions: {}", review)
         self.assertIn(f"uses: openai/codex-action@{CODEX_ACTION_SHA}", review)
         self.assertIn("permission-profile: ':read-only'", review)
-        self.assertIn("safety-strategy: drop-sudo", review)
+        self.assertIn("Create unprivileged Codex user", review)
+        self.assertIn("safety-strategy: unprivileged-user", review)
+        self.assertIn("codex-user: codex-review", review)
+        self.assertNotIn("safety-strategy: drop-sudo", review)
+        self.assertNotIn("codex-home:", review)
         self.assertIn(
             "codex-args: '[\"--ephemeral\",\"--disable\",\"shell_tool\","
             "\"--disable\",\"unified_exec\"]'",

@@ -502,6 +502,18 @@ jobs:
       - name: Prepare partition output directory
         run: mkdir -p codex-review-input/executions/${{ matrix.shard_id }}
 
+      - name: Create unprivileged Codex user
+        if: ${{ steps.readiness.outputs.ready == 'true' }}
+        run: |
+          set -euo pipefail
+          sudo adduser --system --home /home/codex-review --shell /bin/bash \
+            --group codex-review
+          sudo usermod -a -G codex-review runner
+          sudo usermod -a -G runner codex-review
+          sudo chown -R runner:codex-review codex-review-input
+          sudo chmod -R g+rwX codex-review-input
+          sudo find codex-review-input -type d -exec chmod g+s {} +
+
       - name: Run Codex against generated prompt only
         id: run-codex
         if: ${{ steps.readiness.outputs.ready == 'true' }}
@@ -514,9 +526,9 @@ jobs:
           output-schema-file: codex-review-input/model-workspace/codex-output-schema.json
           working-directory: codex-review-input/model-workspace/shards/${{ matrix.shard_id }}
           permission-profile: ':read-only'
-          safety-strategy: drop-sudo
+          safety-strategy: unprivileged-user
+          codex-user: codex-review
           codex-version: ${{ inputs.codex-cli-version }}
-          codex-home: ${{ runner.temp }}/codex-review-home
           codex-args: '["--ephemeral","--disable","shell_tool","--disable","unified_exec"]'
           model: ${{ inputs.model }}
           allow-users: ${{ inputs.allow-users }}
