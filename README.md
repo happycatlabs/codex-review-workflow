@@ -80,8 +80,11 @@ explicitly alongside the automation actor so its update PR can be reviewed.
 | `linear-team-key` | required | Protected caller-owned team key required for the exact ticket. |
 
 Every job uses Happycat's ephemeral Blacksmith Linux runner pool
-(`blacksmith-2vcpu-ubuntu-2404`). Persistent or repository-controlled runners
-are unsupported by this security contract.
+(`blacksmith-2vcpu-ubuntu-2404`). The model job creates a fresh unprivileged
+user and uses Codex Action's `unprivileged-user` safety strategy; the default
+`drop-sudo` strategy is incompatible with Blacksmith's runner sudo setup.
+Persistent or repository-controlled runners are unsupported by this security
+contract.
 
 ## Review meaning
 
