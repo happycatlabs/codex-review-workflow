@@ -1,0 +1,10 @@
+self-hosted-runner:
+  labels:
+    - blacksmith-2vcpu-ubuntu-2404
+
+config-variables: null
+
+paths:
+  .github/workflows/codex-code-review.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined'

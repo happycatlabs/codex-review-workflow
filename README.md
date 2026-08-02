@@ -79,8 +79,9 @@ explicitly alongside the automation actor so its update PR can be reviewed.
 | `allow-bot-users` | empty | Additional exact bot actors accepted by codex-action. Wildcards are not allowed. |
 | `linear-team-key` | required | Protected caller-owned team key required for the exact ticket. |
 
-Every job uses ephemeral GitHub-hosted Linux (`ubuntu-24.04`). A persistent
-self-hosted runner is unsupported by this security contract.
+Every job uses Happycat's ephemeral Blacksmith Linux runner pool
+(`blacksmith-2vcpu-ubuntu-2404`). Persistent or repository-controlled runners
+are unsupported by this security contract.
 
 ## Review meaning
 

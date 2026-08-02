@@ -55,7 +55,7 @@ concurrency:
 jobs:
   trust-guard:
     name: Require current default-branch pull request
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions:
       contents: read
@@ -145,7 +145,7 @@ jobs:
     name: Prepare bounded exact-head source packet
     needs: trust-guard
     if: ${{ needs.trust-guard.result == 'success' && !github.event.pull_request.draft }}
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     permissions:
       contents: read
@@ -350,7 +350,7 @@ jobs:
     name: Resolve exact-ticket intent and seal prompt
     needs: [trust-guard, prepare]
     if: ${{ always() && needs.trust-guard.result == 'success' && needs.prepare.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       contents: read
@@ -462,7 +462,7 @@ jobs:
     name: Run no-tools Codex source-context review (${{ matrix.shard_id }})
     needs: [trust-guard, prepare, intent]
     if: ${{ always() && needs.trust-guard.result == 'success' && needs.prepare.result == 'success' && needs.intent.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions: {}
     strategy:
@@ -575,7 +575,7 @@ jobs:
     name: Publish exact-head source-context result
     needs: [trust-guard, prepare, intent, review]
     if: ${{ always() && needs.trust-guard.result == 'success' && !github.event.pull_request.draft }}
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       actions: read
