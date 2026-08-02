@@ -33,7 +33,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             jobs, ["trust-guard", "prepare", "intent", "review", "publish"]
         )
         runs_on = re.findall(r"^    runs-on: (.+)$", self.workflow, re.MULTILINE)
-        self.assertEqual(runs_on, ["ubuntu-24.04"] * 5)
+        self.assertEqual(runs_on, ["blacksmith-2vcpu-ubuntu-2404"] * 5)
         self.assertNotIn("inputs.runner", self.workflow)
         self.assertNotIn("SENTRY", self.workflow.upper())
 
