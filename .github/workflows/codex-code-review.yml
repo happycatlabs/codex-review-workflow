@@ -508,7 +508,7 @@ jobs:
           set -euo pipefail
           sudo adduser --system --home /home/codex-review --shell /bin/bash \
             --group codex-review
-          sudo usermod -a -G codex-review runner
+          sudo chmod 755 /home/codex-review
           sudo usermod -a -G runner codex-review
           sudo chown -R runner:codex-review codex-review-input
           sudo chmod -R g+rwX codex-review-input

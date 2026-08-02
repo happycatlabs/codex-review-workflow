@@ -121,6 +121,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn(f"uses: openai/codex-action@{CODEX_ACTION_SHA}", review)
         self.assertIn("permission-profile: ':read-only'", review)
         self.assertIn("Create unprivileged Codex user", review)
+        self.assertIn("sudo chmod 755 /home/codex-review", review)
         self.assertIn("safety-strategy: unprivileged-user", review)
         self.assertIn("codex-user: codex-review", review)
         self.assertNotIn("safety-strategy: drop-sudo", review)
