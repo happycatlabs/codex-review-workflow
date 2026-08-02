@@ -83,6 +83,8 @@ Every job uses Happycat's ephemeral Blacksmith Linux runner pool
 (`blacksmith-2vcpu-ubuntu-2404`). The model job creates a fresh unprivileged
 user and uses Codex Action's `unprivileged-user` safety strategy; the default
 `drop-sudo` strategy is incompatible with Blacksmith's runner sudo setup.
+The account's empty home is traversable so the runner-owned API proxy can write
+its protected handoff file, while Codex itself remains unable to use sudo.
 Persistent or repository-controlled runners are unsupported by this security
 contract.
 
