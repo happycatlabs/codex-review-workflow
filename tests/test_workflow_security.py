@@ -148,8 +148,8 @@ class WorkflowSecurityTests(unittest.TestCase):
         ):
             self.assertIn(text, contract)
         for text in (
-            "MAX_CONTEXT_BYTES = 750_000",
-            "MAX_CONTEXT_FILES = 75",
+            "MAX_CONTEXT_BYTES = 1_250_000",
+            "MAX_CONTEXT_FILES = 150",
             "MAX_SCAN_BYTES = 40_000_000",
             "LOOKUP_TIMEOUT_SECONDS = 20",
             'specifier.startswith("@/")',

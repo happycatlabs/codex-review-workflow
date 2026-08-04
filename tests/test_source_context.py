@@ -221,6 +221,22 @@ class SourceContextTests(unittest.TestCase):
             ):
                 self.build(["lib/changed.ts"])
 
+    def test_default_byte_limit_accepts_context_above_previous_envelope(self):
+        imports = []
+        for index in range(8):
+            imports.append(f'import "@/lib/dependency-{index}";')
+            self.repository.write(
+                f"lib/dependency-{index}.ts",
+                f"export const dependency{index} = '" + "x" * 94_000 + "';\n",
+            )
+        self.repository.write("lib/changed.ts", "\n".join(imports) + "\n")
+        self.repository.commit()
+
+        result = self.build(["lib/changed.ts"])
+
+        self.assertGreater(result["manifest"]["bytes_included"], 750_000)
+        self.assertLess(result["manifest"]["bytes_included"], 1_250_000)
+
     def test_scan_limit_rejects_blob_before_reading_it(self):
         self.repository.write("lib/large.ts", "export const large = '" + "x" * 100 + "';\n")
         self.repository.commit()
