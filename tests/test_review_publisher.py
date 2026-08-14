@@ -112,6 +112,8 @@ class FakeGitHubClient:
         self.pull_reads = 0
         self.commit_reads = 0
         self.comment_reads = 0
+        self.review_read_paths: list[str] = []
+        self.comment_read_paths: list[str] = []
 
     def request(self, method: str, path: str, payload=None):
         if method == "POST" and path == "/graphql":
@@ -181,6 +183,7 @@ class FakeGitHubClient:
                 raise review_publisher.GitHubApiError(0, "response lost")
             return copy.deepcopy(review)
         if method == "GET" and "/comments?" in path:
+            self.comment_read_paths.append(path)
             review_id = int(path.split("/reviews/", 1)[1].split("/", 1)[0])
             page = int(path.rsplit("page=", 1)[1])
             if page > 1:
@@ -193,6 +196,7 @@ class FakeGitHubClient:
                 return []
             return copy.deepcopy(self.comments[review_id])
         if method == "GET" and "/reviews/" in path:
+            self.review_read_paths.append(path)
             if self.fail_review_readback:
                 raise review_publisher.GitHubApiError(422, "readback rejected")
             review_id = int(path.rsplit("/", 1)[1])
@@ -304,6 +308,40 @@ class DancerPublisherTests(unittest.TestCase):
         self.assertEqual(fake.comment_reads, 2)
         sleep.assert_called_once_with(
             review_publisher.READBACK_RETRY_DELAYS_SECONDS[0]
+        )
+        self.assertEqual(receipt["review"]["reused"], False)
+
+    def test_run_31838541417_uses_extended_readback_window_without_reposting(self):
+        # The live inline review and comment remained absent from the strict
+        # comment-list read through the original immediate + 1/2/4s window.
+        # Create Review returns the review ID but not individual comment IDs,
+        # so each retry uses that exact review and its scoped comment collection.
+        fake = FakeGitHubClient()
+        fake.hidden_comment_readbacks = 4
+
+        with patch.object(review_publisher.time, "sleep") as sleep:
+            result, receipt = publish_with(fake, [finding()])
+
+        self.assertEqual(result["publication"]["status"], "published")
+        self.assertEqual(result["publication"]["mode"], "inline")
+        self.assertEqual(result["publication"]["inline_comment_count"], 1)
+        self.assertEqual(fake.post_count, 1)
+        self.assertEqual(fake.comment_reads, 5)
+        self.assertEqual(
+            [arguments.args[0] for arguments in sleep.call_args_list],
+            [1, 2, 4, 8],
+        )
+        self.assertEqual(
+            fake.review_read_paths,
+            [f"/repos/happycatlabs/fable/pulls/205/reviews/901"] * 5,
+        )
+        self.assertEqual(
+            fake.comment_read_paths,
+            [
+                "/repos/happycatlabs/fable/pulls/205/reviews/901/comments"
+                "?per_page=100&page=1"
+            ]
+            * 5,
         )
         self.assertEqual(receipt["review"]["reused"], False)
 
