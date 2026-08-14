@@ -424,6 +424,7 @@ jobs:
             --numstat "${STAGING_DIR}/numstat.txt" \
             --status "${STAGING_DIR}/status.txt" \
             --diff "${STAGING_DIR}/diff.patch" \
+            --comment-map "${METADATA_DIR}/comment-map.json" \
             --source-context "${METADATA_DIR}/source-context.json" \
             --intent-context "${METADATA_DIR}/intent-context.json" \
             --output-dir "${MODEL_WORKSPACE}/shards" \

@@ -106,6 +106,10 @@ bounded diff, exact-ticket intent, and exact-head source for eligible changed
 files plus unchanged direct callers and dependencies. The model cannot browse
 or request more files. A `clean` verdict means zero findings in that complete
 bounded packet; it is not whole-repository or feature correctness proof.
+Trusted code also supplies the exact right-side diff intervals as a bounded,
+untrusted inline-anchor map. The model uses those candidates for structured
+locations, while the publisher independently validates every location and
+falls back to the complete summary if an anchor is unavailable.
 The source packet is capped at 150 files and 1,250,000 total bytes, with a
 100,000-byte per-file limit. Any overflow fails closed as
 `SOURCE_CONTEXT_TRUNCATED`; the workflow never silently drops source files.
