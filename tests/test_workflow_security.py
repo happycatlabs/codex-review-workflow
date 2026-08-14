@@ -170,6 +170,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             self.workflow,
         )
         self.assertIn("build-review-shards", self.workflow)
+        self.assertIn('--comment-map "${METADATA_DIR}/comment-map.json"', self.workflow)
         self.assertIn("combine-review-shards", self.workflow)
         self.assertIn("strategy:\n      fail-fast: false\n      matrix:", self.workflow)
         self.assertIn("--lookup-context", self.workflow)
