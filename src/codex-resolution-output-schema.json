@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "properties": {
+    "current_head_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "thread_id": {"type": "string", "minLength": 1},
+          "prior_fingerprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "RESOLVE_ADDRESSED",
+              "RESOLVE_SUPERSEDED",
+              "KEEP_STILL_VALID",
+              "KEEP_AMBIGUOUS"
+            ]
+          },
+          "reason": {"type": "string", "minLength": 1}
+        },
+        "required": ["thread_id", "prior_fingerprint", "decision", "reason"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["current_head_sha", "decisions"],
+  "additionalProperties": false
+}

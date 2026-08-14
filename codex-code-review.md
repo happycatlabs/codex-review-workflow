@@ -3,7 +3,7 @@
 This document defines the `source_context_v1` trust and consumption contract
 for `.github/workflows/codex-code-review.yml`.
 
-## Five-job trust flow
+## Eight-job trust flow
 
 ### 1. Guard
 
@@ -146,6 +146,44 @@ publication failure invalidates a clean result. The job then uploads the
 unchanged v3 result plus a separate `codex-review-publication/v1` receipt and
 fails unless both `verdict == "clean"` and publication succeeded. Reviews,
 comments, and summaries are not approval or merge authority.
+
+### 6. Read-only resolution preparation
+
+Only after a complete successful publication for the still-current exact head,
+trusted preparation reads bounded GraphQL review threads, each exact REST review
+comment and review, and retained v3 result/publication-receipt artifacts. It
+accepts at most 20 unresolved, single-root, modern right-side
+Dancer threads whose body, coordinates, commit, review id, actor, and request
+digest have one unambiguous prior provenance match. An outdated thread remains
+eligible only when its trusted original modern coordinates still match that
+provenance; outdated state alone never authorizes resolution. Human replies,
+legacy-position-only threads, missing/expired artifacts, and ambiguous matches
+remain untouched. Candidate overflow produces zero mutations.
+
+### 7. No-tools resolution decision
+
+The resolution model receives generated candidate evidence only, with no source
+checkout, GitHub authority, or execution tools. It returns exactly one of
+`RESOLVE_ADDRESSED`, `RESOLVE_SUPERSEDED`, `KEEP_STILL_VALID`, or
+`KEEP_AMBIGUOUS` for every model candidate. If the exact prior fingerprint is
+still present in the current v3 result, trusted code deterministically selects
+`KEEP_STILL_VALID` without asking the model. The current review may contain
+other, unrelated findings.
+
+### 8. Trusted non-gating resolution apply
+
+The apply job has no OpenAI credential or pull-request checkout. It receives
+trusted helpers through the immutable preparation artifact and mints a separate
+repository-scoped Dancer token only when a resolve decision exists. Before any
+mutation it revalidates the open PR, exact head/base/default branch, unchanged
+current publication receipt and review, every single-root thread, exact REST
+comment, and retained prior provenance. It then sends one fixed
+`resolveReviewThread(threadId)` mutation per resolve decision, never retries a
+mutation blindly, and reads the exact thread back. Keeps cause no mutation.
+
+Resolution writes only a separate `codex-review-resolution/v1` receipt. Every
+resolution step is non-gating: failure cannot alter the v3 result, publication,
+approval, merge, deployment, or release authority.
 
 ## Machine result
 
@@ -309,13 +347,17 @@ disposable PRs that prove:
 4. a clean summary and a valid changed-line inline finding are both authored by
    verified Dancer, while invalid location, overflow, stale generation, and
    GitHub `422` create complete Dancer-authored summary reviews;
-5. command-shaped source/ticket data cannot execute or obtain credentials.
+5. command-shaped source, ticket, and resolution data cannot execute or obtain
+   credentials;
+6. a prior fixed finding resolves only with exact retained provenance, while a
+   human reply, legacy comment, missing artifact, current matching fingerprint,
+   ambiguity, and candidate overflow all produce zero mutation; outdated state
+   alone never supplies the addressed-or-superseded proof.
 
 The disposable proofs remain unmerged. Do not enable ordinary consumer reviews
 until the caller has the Dancer App secrets and both clean and inline readback
-receipts prove the exact actor. The thread readback added here exists only for
-publication identity and idempotency; superseded-thread resolution is a later,
-separate contract.
+receipts prove the exact actor. Thread resolution remains separate from review
+publication and produces only its own non-gating receipt.
 
 Do not merge a disposable proof PR. Until the immutable pin and proof exist,
 this artifact is not merge authority.

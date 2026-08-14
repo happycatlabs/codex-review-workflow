@@ -14,6 +14,8 @@ INTENT = ROOT / "src/intent_context.py"
 SCHEMA = ROOT / "src/codex-output-schema.json"
 PUBLICATION = ROOT / "src/review_publication.py"
 PUBLISHER = ROOT / "src/review_publisher.py"
+RESOLUTION = ROOT / "src/review_resolution.py"
+RESOLVER = ROOT / "src/review_resolver.py"
 CODEX_ACTION_SHA = "52fe01ec70a42f454c9d2ebd47598f9fd6893d56"
 APP_TOKEN_ACTION_SHA = "bcd2ba49218906704ab6c1aa796996da409d3eb1"
 EXPECTED_WORKFLOW_PATH = (
@@ -29,13 +31,23 @@ class WorkflowSecurityTests(unittest.TestCase):
         block = self.workflow.split(f"  {name}:\n", 1)[1]
         return block.split(f"\n  {next_name}:\n", 1)[0] if next_name else block
 
-    def test_five_bounded_jobs_and_ephemeral_runners(self):
+    def test_eight_bounded_jobs_and_ephemeral_runners(self):
         jobs = re.findall(r"^  ([a-z][a-z0-9-]+):$", self.workflow, re.MULTILINE)
         self.assertEqual(
-            jobs, ["trust-guard", "prepare", "intent", "review", "publish"]
+            jobs,
+            [
+                "trust-guard",
+                "prepare",
+                "intent",
+                "review",
+                "publish",
+                "resolution-prepare",
+                "resolution-review",
+                "resolution-apply",
+            ],
         )
         runs_on = re.findall(r"^    runs-on: (.+)$", self.workflow, re.MULTILINE)
-        self.assertEqual(runs_on, ["blacksmith-2vcpu-ubuntu-2404"] * 5)
+        self.assertEqual(runs_on, ["blacksmith-2vcpu-ubuntu-2404"] * 8)
         self.assertNotIn("inputs.runner", self.workflow)
         self.assertNotIn("SENTRY", self.workflow.upper())
 
@@ -61,14 +73,20 @@ class WorkflowSecurityTests(unittest.TestCase):
         for name, next_name in (
             ("prepare", "intent"),
             ("intent", "review"),
-            ("publish", None),
+            ("publish", "resolution-prepare"),
+            ("resolution-prepare", "resolution-review"),
         ):
             block = self.job(name, next_name)
             self.assertIn("repository: ${{ job.workflow_repository }}", block)
             self.assertIn("ref: ${{ job.workflow_sha }}", block)
             self.assertIn("persist-credentials: false", block)
             self.assertIn("sparse-checkout: src", block)
-            self.assertIn("trusted-workflow/src/review_contract.py", block)
+            expected_helper = (
+                "trusted-workflow/src/review_resolution.py"
+                if name == "resolution-prepare"
+                else "trusted-workflow/src/review_contract.py"
+            )
+            self.assertIn(expected_helper, block)
         self.assertNotIn("# BEGIN REVIEW_CONTRACT", self.workflow)
         self.assertNotIn("contract/review_contract.py", self.workflow)
 
@@ -76,7 +94,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         prepare = self.job("prepare", "intent")
         intent = self.job("intent", "review")
         review = self.job("review", "publish")
-        publish = self.job("publish")
+        publish = self.job("publish", "resolution-prepare")
         self.assertIn("Checkout exact pull request head as data", prepare)
         self.assertNotIn("secrets.", prepare)
         self.assertNotIn("repo-checkout", intent)
@@ -176,7 +194,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("--lookup-context", self.workflow)
 
     def test_publisher_refetches_identity_and_proves_workflow_revision(self):
-        publish = self.job("publish")
+        publish = self.job("publish", "resolution-prepare")
         for text in (
             'gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}"',
             'actions/runs/${GITHUB_RUN_ID}',
@@ -193,7 +211,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn('[ "${publication}" != published ]', publish)
 
     def test_publication_uses_brokered_dancer_token_without_actions_fallback(self):
-        publish = self.job("publish")
+        publish = self.job("publish", "resolution-prepare")
         publisher = PUBLISHER.read_text()
         self.assertIn(
             f"uses: actions/create-github-app-token@{APP_TOKEN_ACTION_SHA}", publish
@@ -235,7 +253,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("publication-receipt.json", self.workflow)
 
     def test_missing_publication_helper_fails_without_posting_partial_summary(self):
-        publish = self.job("publish")
+        publish = self.job("publish", "resolution-prepare")
         fallback = publish.split(
             "      - name: Plan COMMENT review publication\n", 1
         )[1].split("\n      - name: Mint repository-scoped Dancer publisher token\n", 1)[0]
@@ -252,6 +270,49 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn('"event": "COMMENT"', PUBLICATION.read_text())
         self.assertIn('"side": "RIGHT"', PUBLICATION.read_text())
         self.assertNotIn("Fingerprint:", PUBLICATION.read_text())
+
+    def test_resolution_is_non_gating_and_separates_model_from_dancer(self):
+        prepare = self.job("resolution-prepare", "resolution-review")
+        review = self.job("resolution-review", "resolution-apply")
+        apply = self.job("resolution-apply")
+        resolver = RESOLVER.read_text()
+        contract = RESOLUTION.read_text()
+
+        self.assertIn("needs: [trust-guard, publish]", prepare)
+        self.assertIn("continue-on-error: true", prepare)
+        self.assertIn("permissions: {}", review)
+        self.assertIn(f"uses: openai/codex-action@{CODEX_ACTION_SHA}", review)
+        self.assertIn(
+            'codex-args: \'["--ephemeral","--disable","shell_tool",'
+            '"--disable","unified_exec"]\'',
+            review,
+        )
+        self.assertNotIn("DANCER_", review)
+        self.assertNotIn("actions/checkout", review)
+        self.assertNotIn("OPENAI_API_KEY", apply)
+        self.assertNotIn("actions/checkout", apply)
+        self.assertIn(
+            f"uses: actions/create-github-app-token@{APP_TOKEN_ACTION_SHA}", apply
+        )
+        self.assertIn("permission-pull-requests: write", apply)
+        self.assertIn("codex-review-resolution-receipt.json", apply)
+        self.assertNotIn("codex-review-result.json.tmp", apply)
+        self.assertIn("MAX_CANDIDATES = 20", contract)
+        self.assertIn("KEEP_STILL_VALID", contract)
+        self.assertIn("RESOLVE_MUTATION", resolver)
+        self.assertIn(
+            "resolveReviewThread(input: {threadId: $threadId, clientMutationId: $clientMutationId})",
+            resolver,
+        )
+        self.assertIn("resolvedBy", resolver)
+        self.assertIn("GRAPHQL_DANCER_LOGIN", resolver)
+        self.assertIn("workflow_sha=args.workflow_sha", resolver)
+        apply_step = apply.split(
+            "      - name: Revalidate and apply fixed thread mutations\n", 1
+        )[1].split("\n      - name: Normalize missing non-gating receipt\n", 1)[0]
+        self.assertIn("GH_TOKEN: ${{ github.token }}", apply_step)
+        self.assertIn("DANCER_GITHUB_TOKEN:", apply_step)
+        self.assertNotIn("minimizeComment", resolver)
 
     def test_docs_keep_base_controlled_caller_and_no_incremental_state(self):
         docs = README.read_text() + ARCHITECTURE.read_text()

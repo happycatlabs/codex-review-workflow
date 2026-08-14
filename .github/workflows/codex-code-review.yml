@@ -6,6 +6,9 @@ name: Codex Code Review (reusable)
 # 3. intent resolves one owner-bound ticket with protected read credentials;
 # 4. review receives only a generated prompt and no tools or credentials;
 # 5. publish refetches exact PR/base state and emits the machine result.
+# 6. resolution-prepare proves bounded single-root Dancer thread provenance;
+# 7. resolution-review decides proven candidates without GitHub authority;
+# 8. resolution-apply revalidates and writes only a separate non-gating receipt.
 
 on:
   workflow_call:
@@ -1029,3 +1032,319 @@ jobs:
             exit 1
           fi
           echo "Codex source_context_v1 review passed for ${EXPECTED_HEAD_SHA}"
+
+  resolution-prepare:
+    name: Prepare bounded unresolved-thread evidence
+    needs: [trust-guard, publish]
+    if: ${{ always() && needs.trust-guard.result == 'success' && !github.event.pull_request.draft }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      ready: ${{ steps.readiness.outputs.ready }}
+      model_candidate_count: ${{ steps.readiness.outputs.model_candidate_count }}
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REPOSITORY: ${{ github.repository }}
+      RESULT_ARTIFACT: codex-review-result
+      RESOLUTION_INPUT: codex-review-resolution-input
+
+    steps:
+      - name: Checkout exact reusable-workflow source
+        continue-on-error: true
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: trusted-workflow
+          persist-credentials: false
+          sparse-checkout: src
+
+      - name: Download current exact-head result and publication receipt
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ env.RESULT_ARTIFACT }}
+          path: current-review
+
+      - name: Collect proven candidates and seal model input
+        id: prepare-resolution
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RESOLUTION_INPUT}/trusted" "${RESOLUTION_INPUT}/model-workspace"
+          cp trusted-workflow/src/review_resolution.py "${RESOLUTION_INPUT}/trusted/"
+          cp trusted-workflow/src/review_resolver.py "${RESOLUTION_INPUT}/trusted/"
+          cp trusted-workflow/src/review_publication.py "${RESOLUTION_INPUT}/trusted/"
+          cp trusted-workflow/src/review_publisher.py "${RESOLUTION_INPUT}/trusted/"
+          cp trusted-workflow/src/review_contract.py "${RESOLUTION_INPUT}/trusted/"
+          cp trusted-workflow/src/codex-resolution-output-schema.json \
+            "${RESOLUTION_INPUT}/model-workspace/codex-resolution-output-schema.json"
+          python3 trusted-workflow/src/review_resolver.py prepare \
+            --repository "${REPOSITORY}" \
+            --pull-number "${PR_NUMBER}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --workflow-sha "${{ job.workflow_sha }}" \
+            --current-result current-review/codex-review-result.json \
+            --current-receipt current-review/publication-receipt.json \
+            --output "${RESOLUTION_INPUT}/candidates.json"
+          python3 trusted-workflow/src/review_resolution.py prompt \
+            --packet "${RESOLUTION_INPUT}/candidates.json" \
+            --instructions trusted-workflow/src/resolution-instructions.md \
+            --output "${RESOLUTION_INPUT}/model-workspace/codex-resolution-prompt.md"
+
+      - name: Report non-gating resolver readiness
+        id: readiness
+        if: ${{ always() }}
+        run: |
+          set +e
+          packet="${RESOLUTION_INPUT}/candidates.json"
+          if [ -s "${packet}" ] \
+              && [ "$(jq -r '.schema_version // ""' "${packet}")" = codex-review-resolution-candidates/v1 ] \
+              && [[ "$(jq -r '.status // ""' "${packet}")" =~ ^(ready|no_candidates|overflow)$ ]]; then
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+            echo "model_candidate_count=$(jq -r '.model_candidate_count' "${packet}")" \
+              >> "${GITHUB_OUTPUT}"
+          else
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+            echo "model_candidate_count=0" >> "${GITHUB_OUTPUT}"
+          fi
+          exit 0
+
+      - name: Upload immutable resolution input
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex-review-resolution-input
+          path: ${{ env.RESOLUTION_INPUT }}
+          if-no-files-found: warn
+          retention-days: 3
+
+  resolution-review:
+    name: Decide proven unresolved threads without tools
+    needs: resolution-prepare
+    if: ${{ needs.resolution-prepare.outputs.ready == 'true' && fromJSON(needs.resolution-prepare.outputs.model_candidate_count) > 0 }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 20
+    permissions: {}
+
+    steps:
+      - name: Download immutable resolution input
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: codex-review-resolution-input
+          path: codex-review-resolution-input
+
+      - name: Create unprivileged Codex user
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo adduser --system --home /home/codex-resolution --shell /bin/bash \
+            --group codex-resolution
+          sudo chmod 755 /home/codex-resolution
+          sudo usermod -a -G runner codex-resolution
+          mkdir -p codex-review-resolution-output
+          sudo chown -R runner:codex-resolution codex-review-resolution-input
+          sudo chown -R runner:codex-resolution codex-review-resolution-output
+          sudo chmod -R g+rwX codex-review-resolution-input
+          sudo chmod -R g+rwX codex-review-resolution-output
+
+      - name: Run no-tools resolution decision
+        id: run-resolution
+        continue-on-error: true
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: codex-review-resolution-input/model-workspace/codex-resolution-prompt.md
+          output-file: codex-review-resolution-output/codex-output.json
+          output-schema-file: codex-review-resolution-input/model-workspace/codex-resolution-output-schema.json
+          working-directory: codex-review-resolution-input/model-workspace
+          permission-profile: ':read-only'
+          safety-strategy: unprivileged-user
+          codex-user: codex-resolution
+          codex-version: ${{ inputs.codex-cli-version }}
+          codex-args: '["--ephemeral","--disable","shell_tool","--disable","unified_exec"]'
+          model: ${{ inputs.model }}
+          allow-users: ${{ inputs.allow-users }}
+          allow-bot-users: ${{ inputs.allow-bot-users }}
+
+      - name: Record non-gating model outcome
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          RESOLUTION_OUTCOME: ${{ steps.run-resolution.outcome }}
+        run: |
+          set +e
+          mkdir -p codex-review-resolution-output
+          if [ "${RESOLUTION_OUTCOME}" = success ] \
+              && [ -s codex-review-resolution-output/codex-output.json ]; then
+            printf '{"status":"success"}\n' \
+              > codex-review-resolution-output/execution.json
+          else
+            printf '{"status":"error","code":"RESOLUTION_MODEL_FAILED"}\n' \
+              > codex-review-resolution-output/execution.json
+          fi
+          exit 0
+
+      - name: Upload isolated resolution output
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex-review-resolution-output
+          path: codex-review-resolution-output
+          if-no-files-found: warn
+          retention-days: 3
+
+  resolution-apply:
+    name: Apply proven thread resolutions without gating review
+    needs: [trust-guard, publish, resolution-prepare, resolution-review]
+    if: ${{ always() && needs.trust-guard.result == 'success' && !github.event.pull_request.draft }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REPOSITORY: ${{ github.repository }}
+
+    steps:
+      - name: Download current exact-head result and publication receipt
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: codex-review-result
+          path: current-review
+
+      - name: Download immutable resolution input and trusted helpers
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: codex-review-resolution-input
+          path: codex-review-resolution-input
+
+      - name: Download isolated resolution output
+        if: ${{ needs.resolution-review.result == 'success' }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: codex-review-resolution-output
+          path: codex-review-resolution-output
+
+      - name: Build hash-bound apply plan
+        id: plan-resolution
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          helper=codex-review-resolution-input/trusted/review_resolution.py
+          args=(
+            plan
+            --packet codex-review-resolution-input/candidates.json
+            --output codex-review-resolution-plan.json
+          )
+          if [ -s codex-review-resolution-output/codex-output.json ]; then
+            args+=(--model-output codex-review-resolution-output/codex-output.json)
+          fi
+          python3 "${helper}" "${args[@]}"
+
+      - name: Determine whether Dancer authority is required
+        id: authority
+        if: ${{ always() }}
+        run: |
+          set +e
+          if [ -s codex-review-resolution-plan.json ]; then
+            count=$(jq '[.decisions[] | select(.decision == "RESOLVE_ADDRESSED" or .decision == "RESOLVE_SUPERSEDED")] | length' \
+              codex-review-resolution-plan.json 2>/dev/null)
+          else
+            count=0
+          fi
+          if [[ "${count}" =~ ^[0-9]+$ ]] && [ "${count}" -gt 0 ]; then
+            echo "required=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "required=false" >> "${GITHUB_OUTPUT}"
+          fi
+          exit 0
+
+      - name: Mint repository-scoped Dancer resolver token
+        id: dancer-resolution-token
+        if: ${{ steps.authority.outputs.required == 'true' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DANCER_APP_ID }}
+          private-key: ${{ secrets.DANCER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: write
+
+      - name: Revalidate and apply fixed thread mutations
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DANCER_GITHUB_TOKEN: ${{ steps.dancer-resolution-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 codex-review-resolution-input/trusted/review_resolver.py apply \
+            --repository "${REPOSITORY}" \
+            --pull-number "${PR_NUMBER}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --current-result current-review/codex-review-result.json \
+            --current-receipt current-review/publication-receipt.json \
+            --packet codex-review-resolution-input/candidates.json \
+            --plan codex-review-resolution-plan.json \
+            --receipt-output codex-review-resolution-receipt.json
+
+      - name: Normalize missing non-gating receipt
+        if: ${{ always() }}
+        run: |
+          set +e
+          if [ ! -s codex-review-resolution-receipt.json ]; then
+            jq -n \
+              --arg repository "${REPOSITORY}" \
+              --argjson pull_number "${PR_NUMBER}" \
+              --argjson actions_run_id "${GITHUB_RUN_ID}" \
+              '{schema_version:"codex-review-resolution/v1",status:"failed",
+                repository:$repository,pull_number:$pull_number,
+                actions_run_id:$actions_run_id,packet_sha256:null,plan_sha256:null,
+                expected_generation:null,observed_generation:null,
+                current_publication:null,actor:null,candidate_count:0,
+                resolve_count:0,results:[],observations:[],
+                error:"RESOLUTION_UNAVAILABLE"}' \
+              > codex-review-resolution-receipt.json
+          fi
+          exit 0
+
+      - name: Upload separate non-gating resolution receipt
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex-review-resolution
+          path: codex-review-resolution-receipt.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Write non-gating resolution summary
+        if: ${{ always() }}
+        run: |
+          set +e
+          receipt=codex-review-resolution-receipt.json
+          {
+            echo "## Codex review-thread resolution"
+            echo
+            echo "- Status: \`$(jq -r '.status' "${receipt}")\`"
+            echo "- Candidates: \`$(jq -r '.candidate_count' "${receipt}")\`"
+            echo "- Resolve decisions: \`$(jq -r '.resolve_count' "${receipt}")\`"
+            echo "- This receipt is non-gating and does not alter the v3 review verdict."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit 0
