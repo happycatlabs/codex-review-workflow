@@ -2,7 +2,8 @@
 
 Reusable exact-snapshot Codex review for `happycatlabs/*` pull requests.
 
-The V2 workflow has five jobs:
+The V2 workflow has five review-gate jobs followed by three isolated,
+non-gating thread-resolution jobs:
 
 1. verify a base-controlled `pull_request_target` still targets the repository's
    current default branch and that its live base is an ancestor of the PR head;
@@ -16,6 +17,14 @@ The V2 workflow has five jobs:
    commentable lines from the exact diff in trusted code, mint one repository-
    scoped Dancer installation token, and publish one verified `COMMENT` review
    plus machine evidence before failing closed unless the result is clean.
+6. collect at most 20 unresolved single-root modern Dancer threads whose exact
+   review and comment identity can be rebuilt from retained v3 results and
+   publication receipts;
+7. ask a second no-tools, no-GitHub Codex call only about proven candidates whose
+   prior fingerprint is absent from the current result; and
+8. mint separate Dancer authority only for resolve decisions, revalidate the
+   exact generation, receipt, thread, and provenance, then apply one fixed
+   `resolveReviewThread` mutation per candidate with exact readback.
 
 ## Consumer setup
 
@@ -157,6 +166,17 @@ SHA, and current default-branch SHA. It also reads back the Dancer-authored
 review and every inline comment. An exact hidden request marker makes response
 recovery and identical reruns idempotent; it does not resolve or alter any old
 thread.
+
+The later resolution path is deliberately narrower. Human-replied,
+legacy-position-only, ambiguous, and missing/expired-provenance threads remain
+untouched. Outdated state is evidence only and never authorizes resolution by
+itself; trusted original modern coordinates remain eligible for a separate
+addressed-or-superseded decision. More than 20 proven candidates causes zero
+mutations. An exact prior
+fingerprint still present in the current v3 result is deterministically kept
+open, even when the current review has unrelated findings. Resolver failure is
+recorded only in a separate `codex-review-resolution/v1` receipt and cannot
+change the v3 verdict, publication, or review gate.
 
 See
 [`codex-code-review.md`](codex-code-review.md) for the schema, trust boundaries,
