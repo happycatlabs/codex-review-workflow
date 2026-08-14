@@ -6,6 +6,7 @@ import json
 import pathlib
 import re
 import subprocess
+import urllib.parse
 from typing import Any
 
 
@@ -18,6 +19,9 @@ STALE_PUBLICATION_CODES = {
     "STALE_BASE",
     "STALE_HEAD",
 }
+REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 def load_json(path: pathlib.Path) -> Any:
@@ -38,6 +42,45 @@ def safe_relative_path(value: str) -> str | None:
     if any(ord(character) < 32 for character in value):
         return None
     return path.as_posix()
+
+
+def markdown_link_label(value: str) -> str:
+    escaped = value.replace("\\", "\\\\")
+    for character in ("[", "]", "(", ")", "`"):
+        escaped = escaped.replace(character, f"\\{character}")
+    return escaped
+
+
+def machine_fingerprints(result: dict[str, Any]) -> tuple[str, ...]:
+    values = result.get("finding_fingerprints", [])
+    findings = result.get("findings", [])
+    candidates = list(values) if isinstance(values, list) else []
+    if isinstance(findings, list):
+        candidates.extend(
+            finding.get("fingerprint")
+            for finding in findings
+            if isinstance(finding, dict)
+        )
+    return tuple(
+        dict.fromkeys(
+            value
+            for value in candidates
+            if isinstance(value, str) and FINGERPRINT_PATTERN.fullmatch(value)
+        )
+    )
+
+
+def public_prose(value: str, fingerprints: tuple[str, ...]) -> str:
+    prose = value
+    for fingerprint in fingerprints:
+        prose = re.sub(
+            re.escape(fingerprint),
+            "[machine-only finding identifier omitted]",
+            prose,
+            flags=re.IGNORECASE,
+        )
+    prose = " ".join(prose.split())
+    return prose.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def parse_commentable_lines(diff: str) -> tuple[dict[str, list[list[int]]], bool]:
@@ -169,72 +212,206 @@ def finding_location(finding: dict[str, Any]) -> str:
     return f"{finding['file']}:{line_label}"
 
 
-def complete_review_body(
-    result: dict[str, Any], fallback_reason: str | None
+def immutable_code_link(
+    repository: str, head_sha: str, finding: dict[str, Any]
+) -> str | None:
+    path = safe_relative_path(finding["file"])
+    if (
+        REPOSITORY_PATTERN.fullmatch(repository) is None
+        or SHA_PATTERN.fullmatch(head_sha) is None
+        or path is None
+    ):
+        return None
+    start_line = finding["start_line"]
+    end_line = finding["line"]
+    fragment = f"#L{start_line}" if start_line == end_line else f"#L{start_line}-L{end_line}"
+    encoded_path = urllib.parse.quote(path, safe="/")
+    label = markdown_link_label(finding_location({**finding, "file": path}))
+    return (
+        f"[{label}](https://github.com/{repository}/blob/"
+        f"{head_sha}/{encoded_path}{fragment})"
+    )
+
+
+def immutable_head_link(repository: str, head_sha: str) -> str | None:
+    if (
+        REPOSITORY_PATTERN.fullmatch(repository) is None
+        or SHA_PATTERN.fullmatch(head_sha) is None
+    ):
+        return None
+    return f"[`{head_sha}`](https://github.com/{repository}/commit/{head_sha})"
+
+
+def actions_run_link(repository: str, run_id: int) -> str:
+    if REPOSITORY_PATTERN.fullmatch(repository) is None or run_id < 1:
+        raise ValueError("invalid Actions run identity")
+    return f"https://github.com/{repository}/actions/runs/{run_id}"
+
+
+def finding_action() -> str:
+    return "Action: Correct the described failure before merging."
+
+
+def finding_body(
+    finding: dict[str, Any],
+    repository: str,
+    head_sha: str,
+    fingerprints: tuple[str, ...],
 ) -> str:
+    location = immutable_code_link(repository, head_sha, finding)
+    title = public_prose(finding["title"], fingerprints)
+    body = public_prose(finding["body"], fingerprints)
+    lines = [f"**{finding['severity']} — {title}**"]
+    if location is not None:
+        lines.extend(["", location])
+    lines.extend(
+        ["", f"**Impact and trigger:** {body}", "", finding_action()]
+    )
+    return "\n".join(lines)
+
+
+def alert_lines(result: dict[str, Any]) -> list[str]:
     error = result.get("error")
-    if isinstance(error, dict) and error.get("code") == "TICKET_CONTEXT_MISSING":
-        lines = [
-            (
-                f"Codex review skipped (`{error['code']}`): "
-                f"{error['reason']} Automatic approval remains disabled."
-            )
-        ]
-    else:
-        lines = [result["summary"].strip()]
-    if isinstance(error, dict):
-        if error.get("code") != "TICKET_CONTEXT_MISSING":
-            lines.extend(
-                [
-                    "",
-                    (
-                        f"Review infrastructure error: `{error['code']}` — "
-                        f"{error['reason']}"
-                    ),
-                ]
-            )
-    if fallback_reason:
-        lines.extend(
-            [
-                "",
-                f"Inline publication fallback: `{fallback_reason}`.",
-            ]
-        )
     findings = result.get("findings", [])
-    if findings:
-        lines.extend(["", "### Findings"])
+    coverage = result.get("coverage")
+    lookup = result.get("lookup_context")
+    complete = (
+        isinstance(coverage, dict)
+        and coverage.get("complete") is True
+        and coverage.get("truncated") is False
+        and isinstance(lookup, dict)
+        and lookup.get("complete") is True
+    )
+    if (
+        result.get("verdict") == "clean"
+        and error is None
+        and not findings
+        and complete
+    ):
+        return [
+            "> [!NOTE]",
+            "> No concrete issues were found in the complete bounded review packet.",
+        ]
+    if isinstance(error, dict) and error.get("code") == "TICKET_CONTEXT_MISSING":
+        message = (
+            f"Review skipped (`{error['code']}`) because trusted task context was unavailable. "
+            "Automatic approval remains disabled."
+        )
+    elif isinstance(error, dict):
+        preserved = (
+            f" {len(findings)} concrete finding(s) were preserved."
+            if findings
+            else ""
+        )
+        message = (
+            f"Review incomplete because `{error['code']}` stopped the trusted workflow."
+            f"{preserved}"
+        )
+    else:
+        count = len(findings)
+        message = (
+            f"{count} actionable finding{'s' if count != 1 else ''} require attention. "
+            "This COMMENT review does not approve or request changes."
+        )
+    return ["> [!CAUTION]", f"> {message}"]
+
+
+def coverage_summary(result: dict[str, Any]) -> str:
+    coverage = result.get("coverage")
+    if not isinstance(coverage, dict):
+        return "coverage unavailable"
+    complete = coverage.get("complete") is True and coverage.get("truncated") is False
+    status = "complete" if complete else "incomplete"
+    diff_bytes = coverage.get("diff_bytes_included")
+    source_bytes = coverage.get("source_context_bytes")
+    if type(diff_bytes) is int and type(source_bytes) is int:
+        return f"{status}; {diff_bytes} diff bytes and {source_bytes} source-context bytes"
+    return status
+
+
+def review_body(
+    result: dict[str, Any],
+    *,
+    fallback_reason: str | None,
+    include_findings: bool,
+    repository: str,
+    run_id: int,
+) -> str:
+    lines = ["## Codex review", "", *alert_lines(result)]
+    fingerprints = machine_fingerprints(result)
+    lines.extend(
+        [
+            "",
+            "### Production impact",
+            "",
+            public_prose(result["summary"], fingerprints),
+        ]
+    )
+
+    findings = result.get("findings", [])
+    if include_findings and findings:
+        lines.extend(["", "#### Findings"])
         for index, finding in enumerate(findings, 1):
-            lines.extend(
-                [
-                    "",
-                    (
-                        f"{index}. **{finding['severity']}: {finding['title']}** "
-                        f"(`{finding_location(finding)}`)"
-                    ),
-                    "",
-                    finding["body"].strip(),
-                    "",
-                    f"Fingerprint: `{finding['fingerprint']}`",
-                ]
+            rendered = finding_body(
+                finding,
+                repository,
+                result.get("head_sha", ""),
+                fingerprints,
             )
+            lines.extend(["", f"{index}. {rendered}"])
+
+    lines.extend(["", "### Evidence", ""])
+    head = immutable_head_link(repository, result.get("head_sha", ""))
+    lines.append(f"- Reviewed head: {head or 'unavailable before exact-snapshot binding'}")
+    lines.append(
+        f"- Scope: `{result.get('review_scope', 'unknown')}`; {coverage_summary(result)}."
+    )
+    run_url = actions_run_link(repository, run_id)
+    lines.append(
+        f"- Full result: [Actions run and `codex-review-result` artifact]({run_url})."
+    )
+    if fallback_reason:
+        lines.append(
+            f"- Publication: complete summary fallback (`{fallback_reason}`); "
+            "no finding was omitted."
+        )
     return "\n".join(lines).strip()
 
 
-def inline_review_body(result: dict[str, Any]) -> str:
-    finding_count = len(result["findings"])
-    return (
-        f"{result['summary'].strip()}\n\n"
-        f"{finding_count} finding{'s' if finding_count != 1 else ''} "
-        "published as resolvable inline comments."
+def complete_review_body(
+    result: dict[str, Any],
+    fallback_reason: str | None,
+    repository: str,
+    run_id: int,
+) -> str:
+    return review_body(
+        result,
+        fallback_reason=fallback_reason,
+        include_findings=True,
+        repository=repository,
+        run_id=run_id,
     )
 
 
-def comment_body(finding: dict[str, Any]) -> str:
-    return (
-        f"**{finding['severity']}: {finding['title']}**\n\n"
-        f"{finding['body'].strip()}\n\n"
-        f"Fingerprint: `{finding['fingerprint']}`"
+def inline_review_body(
+    result: dict[str, Any], repository: str, run_id: int
+) -> str:
+    return review_body(
+        result,
+        fallback_reason=None,
+        include_findings=False,
+        repository=repository,
+        run_id=run_id,
     )
+
+
+def comment_body(
+    finding: dict[str, Any],
+    repository: str,
+    head_sha: str,
+    fingerprints: tuple[str, ...],
+) -> str:
+    return finding_body(finding, repository, head_sha, fingerprints)
 
 
 def comment_map_matches(
@@ -269,9 +446,18 @@ def range_is_commentable(
 
 
 def plan_publication(
-    result: dict[str, Any], comment_map: Any
+    result: dict[str, Any],
+    comment_map: Any,
+    *,
+    repository: str,
+    run_id: int,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if REPOSITORY_PATTERN.fullmatch(repository) is None:
+        raise ValueError("invalid repository identity")
+    if run_id < 1:
+        raise ValueError("invalid Actions run identity")
     findings = result.get("findings", [])
+    fingerprints = machine_fingerprints(result)
     fallback_reason: str | None = None
     comments: list[dict[str, Any]] = []
 
@@ -299,7 +485,12 @@ def plan_publication(
                 "path": path,
                 "line": end_line,
                 "side": "RIGHT",
-                "body": comment_body(finding),
+                "body": comment_body(
+                    finding,
+                    repository,
+                    result["head_sha"],
+                    fingerprints,
+                ),
             }
             if start_line != end_line:
                 comment["start_line"] = start_line
@@ -308,7 +499,7 @@ def plan_publication(
 
     inline = bool(findings) and fallback_reason is None
     summary_request = {
-        "body": complete_review_body(result, fallback_reason),
+        "body": complete_review_body(result, fallback_reason, repository, run_id),
         "event": "COMMENT",
     }
     if error_code not in STALE_PUBLICATION_CODES:
@@ -317,7 +508,7 @@ def plan_publication(
     request = (
         {
             "commit_id": result["head_sha"],
-            "body": inline_review_body(result),
+            "body": inline_review_body(result, repository, run_id),
             "event": "COMMENT",
             "comments": comments,
         }
@@ -388,7 +579,12 @@ def command_plan(args: argparse.Namespace) -> None:
         comment_map = load_json(pathlib.Path(args.comment_map))
     except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):
         comment_map = {}
-    updated, request, summary_request = plan_publication(result, comment_map)
+    updated, request, summary_request = plan_publication(
+        result,
+        comment_map,
+        repository=args.repository,
+        run_id=args.run_id,
+    )
     write_json(pathlib.Path(args.output), updated)
     write_json(pathlib.Path(args.request_output), request)
     write_json(pathlib.Path(args.summary_request_output), summary_request)
@@ -423,6 +619,8 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("--output", required=True)
     plan.add_argument("--request-output", required=True)
     plan.add_argument("--summary-request-output", required=True)
+    plan.add_argument("--repository", required=True)
+    plan.add_argument("--run-id", required=True, type=int)
     plan.set_defaults(handler=command_plan)
 
     record = commands.add_parser("record")

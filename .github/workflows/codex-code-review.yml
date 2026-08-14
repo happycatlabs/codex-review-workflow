@@ -47,6 +47,12 @@ on:
       LINEAR_CLIENT_SECRET:
         description: 'Read-only Linear OAuth client secret.'
         required: false
+      DANCER_APP_ID:
+        description: 'Dancer GitHub App id used only by the trusted publisher.'
+        required: false
+      DANCER_PRIVATE_KEY:
+        description: 'Dancer GitHub App private key used only to mint a short-lived publisher token.'
+        required: false
 
 concurrency:
   group: codex-source-context-v1-${{ github.event.pull_request.number }}
@@ -592,7 +598,7 @@ jobs:
     permissions:
       actions: read
       contents: read
-      pull-requests: write
+      pull-requests: read
     env:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       REPOSITORY: ${{ github.repository }}
@@ -901,7 +907,9 @@ jobs:
               --comment-map codex-review-input/metadata/comment-map.json \
               --output codex-review-result/codex-review-result.json \
               --request-output codex-review-result/review-request.json \
-              --summary-request-output codex-review-result/summary-review-request.json
+              --summary-request-output codex-review-result/summary-review-request.json \
+              --repository "${REPOSITORY}" \
+              --run-id "${GITHUB_RUN_ID}"
           else
             jq -n \
               '{body:"Codex review publication helper is unavailable.",
@@ -920,159 +928,54 @@ jobs:
               codex-review-result/codex-review-result.json
           fi
 
-      - name: Revalidate and publish COMMENT review
+      - name: Mint repository-scoped Dancer publisher token
+        id: dancer-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DANCER_APP_ID }}
+          private-key: ${{ secrets.DANCER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: write
+
+      - name: Revalidate and publish Dancer COMMENT review
         env:
-          GH_TOKEN: ${{ github.token }}
+          DANCER_GITHUB_TOKEN: ${{ steps.dancer-token.outputs.token }}
         run: |
           set -euo pipefail
-          helper=trusted-workflow/src/review_publication.py
+          helper=trusted-workflow/src/review_publisher.py
           result=codex-review-result/codex-review-result.json
           request=codex-review-result/review-request.json
           summary_request=codex-review-result/summary-review-request.json
-          planned_status=$(jq -r '.publication.status' "${result}")
-          planned_mode=$(jq -r '.publication.mode' "${result}")
-          planned_fallback=$(jq -r '.publication.fallback_reason // ""' "${result}")
-          planned_inline=$(jq -r '.publication.inline_comment_count' "${result}")
-          status=failed
-          mode="${planned_mode}"
-          fallback_reason="${planned_fallback}"
-          inline_count="${planned_inline}"
-
-          repo_json=$(mktemp)
-          pr_json=$(mktemp)
-          default_commit_json=$(mktemp)
-          state_valid=false
-          generation_current=false
-          refresh_generation_state() {
-            state_valid=false
-            generation_current=false
-            if gh api "repos/${REPOSITORY}" > "${repo_json}" \
-                && gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" > "${pr_json}"; then
-              default_branch=$(jq -r '.default_branch // ""' "${repo_json}")
-              encoded_default_branch=$(jq -rn --arg value "${default_branch}" '$value | @uri')
-              if [ -n "${default_branch}" ] \
-                  && gh api "repos/${REPOSITORY}/commits/${encoded_default_branch}" \
-                    > "${default_commit_json}"; then
-                state_valid=true
-                current_state=$(jq -r '.state // ""' "${pr_json}")
-                current_head=$(jq -r '.head.sha // ""' "${pr_json}")
-                current_base_ref=$(jq -r '.base.ref // ""' "${pr_json}")
-                current_base_sha=$(jq -r '.base.sha // ""' "${pr_json}")
-                current_default_sha=$(jq -r '.sha // ""' "${default_commit_json}")
-                if [ "${current_state}" = open ] \
-                    && [ "${current_head}" = "${EXPECTED_HEAD_SHA}" ] \
-                    && [ "${current_base_ref}" = "${EXPECTED_BASE_REF}" ] \
-                    && [ "${current_base_sha}" = "${EXPECTED_BASE_SHA}" ] \
-                    && [ "${default_branch}" = "${EXPECTED_BASE_REF}" ] \
-                    && [ "${current_default_sha}" = "${EXPECTED_BASE_SHA}" ]; then
-                  generation_current=true
-                fi
-              fi
-            fi
-          }
-          refresh_generation_state
-
-          publish_review() {
-            local input=$1
-            local response=$2
-            local error=$3
-            gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
-              --method POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              --input "${input}" --include > "${response}" 2> "${error}"
-          }
-
-          if [ "${planned_status}" = failed ]; then
-            status=failed
-          elif [ "${state_valid}" != true ]; then
-            fallback_reason=PUBLICATION_STATE_LOOKUP_FAILED
-            inline_count=0
-          elif [ "${generation_current}" != true ]; then
-            fallback_reason=STALE_BEFORE_PUBLICATION
-            mode=summary
-            inline_count=0
-            jq 'if (.body | contains("Inline publication fallback:"))
-                then . else
-                  .body += "\n\nInline publication fallback: `STALE_BEFORE_PUBLICATION`."
-                end | del(.commit_id)' "${summary_request}" \
-              > codex-review-result/stale-summary-review-request.json
-            if publish_review \
-                codex-review-result/stale-summary-review-request.json \
-                codex-review-result/review-response.txt \
-                codex-review-result/review-error.txt; then
-              status=published
-            fi
-          elif publish_review "${request}" \
-              codex-review-result/review-response.txt \
-              codex-review-result/review-error.txt; then
-            status=published
-          elif [ "${planned_mode}" = inline ]; then
-            if grep -Eq '(^HTTP/[^ ]+ 422|\(HTTP 422\))' \
-                codex-review-result/review-response.txt \
-                codex-review-result/review-error.txt; then
-              refresh_generation_state
-              mode=summary
-              inline_count=0
-              if [ "${state_valid}" != true ]; then
-                fallback_reason=PUBLICATION_STATE_LOOKUP_FAILED
-              elif [ "${generation_current}" != true ]; then
-                fallback_reason=STALE_BEFORE_PUBLICATION
-                jq 'if (.body | contains("Inline publication fallback:"))
-                    then . else
-                      .body += "\n\nInline publication fallback: `STALE_BEFORE_PUBLICATION`."
-                    end | del(.commit_id)' "${summary_request}" \
-                  > codex-review-result/api-summary-review-request.json
-                if publish_review \
-                    codex-review-result/api-summary-review-request.json \
-                    codex-review-result/summary-response.txt \
-                    codex-review-result/summary-error.txt; then
-                  status=published
-                fi
-              else
-                fallback_reason=GITHUB_422
-                jq --arg reason "${fallback_reason}" \
-                  '.body += "\n\nInline publication fallback: `" + $reason + "`."' \
-                  "${summary_request}" \
-                  > codex-review-result/api-summary-review-request.json
-                if publish_review \
-                    codex-review-result/api-summary-review-request.json \
-                    codex-review-result/summary-response.txt \
-                    codex-review-result/summary-error.txt; then
-                  status=published
-                fi
-              fi
-            else
-              fallback_reason=INLINE_PUBLICATION_FAILED
-              inline_count=0
-            fi
-          else
-            fallback_reason=SUMMARY_PUBLICATION_FAILED
-          fi
-
           if [ -s "${helper}" ]; then
-            python3 "${helper}" record \
+            python3 "${helper}" publish \
               --result "${result}" \
-              --status "${status}" \
-              --mode "${mode}" \
-              --fallback-reason "${fallback_reason}" \
-              --inline-comment-count "${inline_count}" \
-              --output "${result}"
+              --request "${request}" \
+              --summary-request "${summary_request}" \
+              --repository "${REPOSITORY}" \
+              --run-id "${GITHUB_RUN_ID}" \
+              --receipt-output codex-review-result/publication-receipt.json
           else
             jq \
-              --arg status "${status}" \
-              --arg mode "${mode}" \
-              --arg reason "${fallback_reason}" \
-              --argjson inline_count "${inline_count}" \
-              '.publication={status:$status,mode:$mode,
-                fallback_reason:(if $reason == "" then null else $reason end),
-                inline_comment_count:$inline_count}
-              | if $status == "failed" and .verdict == "clean"
-                then .verdict="error"
+              '.publication={status:"failed",mode:"summary",
+                fallback_reason:"COMMENT_HELPER_MISSING",inline_comment_count:0}
+              | if .verdict != "error" then .verdict="error"
                 | .error={code:"PUBLICATION_FAILED",
                     reason:"The exact-head review result could not be published."}
                 else . end' "${result}" > codex-review-result/codex-review-result.tmp
             mv codex-review-result/codex-review-result.tmp "${result}"
+            jq -n \
+              --arg repository "${REPOSITORY}" \
+              --argjson pull_number "${PR_NUMBER}" \
+              --argjson actions_run_id "${GITHUB_RUN_ID}" \
+              '{schema_version:"codex-review-publication/v1",status:"failed",
+                repository:$repository,pull_number:$pull_number,
+                actions_run_id:$actions_run_id,expected_generation:null,
+                observed_generation:null,actor:null,event:"COMMENT",mode:"summary",
+                fallback_reason:"COMMENT_HELPER_MISSING",review:null}' \
+              > codex-review-result/publication-receipt.json
           fi
 
       - name: Upload exact-head machine result
@@ -1080,7 +983,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ env.RESULT_ARTIFACT }}
-          path: codex-review-result/codex-review-result.json
+          path: |
+            codex-review-result/codex-review-result.json
+            codex-review-result/publication-receipt.json
           if-no-files-found: error
           retention-days: 30
 

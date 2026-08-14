@@ -106,7 +106,8 @@ findings already returned by successful partitions.
 
 Publication has no model or Linear credential. It refetches current PR and
 default-branch state and rejects closure, retargeting, head drift, base drift,
-lookup failure, or invalid identity before accepting model output.
+lookup failure, or invalid identity before accepting model output. The caller's
+`${{ github.token }}` is read-only in this job and can never author a review.
 
 It reads the Actions run with `actions: read`, requires exactly one immutable
 reusable-workflow provenance entry for
@@ -116,15 +117,35 @@ right-side added-line ranges from the exact `BASE..HEAD` diff. The model supplie
 only candidate file/range hints; it cannot supply GitHub side, diff position,
 commit, or review event.
 
-The publisher re-fetches the PR again immediately before writing and submits
-one review with `event: COMMENT`. When every finding is addressable and the
-count is at most 20, the review contains resolvable inline threads bound to the
-exact head. Invalid or stale coordinates, comment overflow, generation drift,
-and inline API rejection produce one complete summary review with a stable
-fallback reason. Publication is all-inline or all-summary, never partial. A
+The trusted publish job gives the pinned official GitHub App token action only
+the caller-owned Dancer App id and private key. That broker mints a short-lived
+token limited to the current repository with `contents: read` and
+`pull-requests: write`; the key never reaches a shell environment, artifact,
+source checkout, intent job, or model job. The publisher proves the token's
+GraphQL viewer is exactly `dancer-automation[bot]` actor id `266699010` and has
+no `${{ github.token }}` or human-author fallback.
+
+The publisher reads bounded, paginated review evidence for an exact hidden
+request digest, then re-fetches the PR again immediately before writing and
+submits one review with `event: COMMENT`. When every finding is addressable and
+the count is at most 20, the review contains resolvable inline threads bound to
+the exact head. Invalid or stale coordinates, comment overflow, generation
+drift, and inline API rejection produce one complete summary review with a
+stable fallback reason. Publication is all-inline or all-summary, never
+partial. After a mutation or an ambiguous response, the publisher reads back
+the exact review and its complete inline-comment set and verifies Dancer actor,
+body, commit, locations, and comment bodies. An identical request reuses only
+that fully verified review; it never mutates or resolves an older thread.
+
+Public prose is deterministic and risk-first: title, `NOTE` or `CAUTION`,
+production impact, then evidence. Structured code locations are immutable
+`blob/<head>/<safe-path>#Lx-Ly` links with escaped display labels. The trusted
+renderer flattens model-controlled prose, escapes HTML controls, and redacts
+every exact machine fingerprint before publication. A
 publication failure invalidates a clean result. The job then uploads the
-machine artifact and fails unless both `verdict == "clean"` and publication
-succeeded. Reviews, comments, and summaries are not approval or merge authority.
+unchanged v3 result plus a separate `codex-review-publication/v1` receipt and
+fails unless both `verdict == "clean"` and publication succeeded. Reviews,
+comments, and summaries are not approval or merge authority.
 
 ## Machine result
 
@@ -260,6 +281,10 @@ Publication fallback reasons are a separate, stable diagnostic enum:
 | `STALE_BEFORE_PUBLICATION` | The pull request generation changed during the final write boundary; the old result is retained only in a summary without the old commit binding. |
 | `PUBLICATION_STATE_LOOKUP_FAILED`, `INLINE_PUBLICATION_FAILED`, `SUMMARY_PUBLICATION_FAILED` | Publication could not safely determine or complete a write; no ambiguous retry is attempted. |
 | `COMMENT_HELPER_MISSING` | The immutable trusted publication helper was unavailable, so publication failed without posting a partial result. |
+| `DANCER_AUTH_UNAVAILABLE`, `DANCER_ACTOR_MISMATCH` | The short-lived Dancer authority could not be minted or did not read back as the exact trusted App actor. |
+| `PUBLICATION_REQUEST_INVALID` | A planned write was not an exact bounded `COMMENT` request, so Dancer authority was never used. |
+| `PUBLICATION_EVIDENCE_INVALID`, `PUBLICATION_EVIDENCE_LIMIT_EXCEEDED` | Existing review/comment evidence was malformed, ambiguous, or exceeded the bounded read. |
+| `PUBLICATION_READBACK_FAILED`, `PUBLICATION_MUTATION_AMBIGUOUS` | The exact Dancer review and comments could not be verified after the one allowed mutation attempt. |
 
 ## Immutable helper packaging
 
@@ -281,10 +306,16 @@ disposable PRs that prove:
    review is found;
 3. clean, finding, missing/malformed context, wrong team, provider failure,
    head drift, and base drift remain exact-generation bound;
-4. a valid changed line creates an exact-head inline thread, while invalid
-   location, overflow, stale generation, and GitHub `422` create complete
-   summary reviews;
+4. a clean summary and a valid changed-line inline finding are both authored by
+   verified Dancer, while invalid location, overflow, stale generation, and
+   GitHub `422` create complete Dancer-authored summary reviews;
 5. command-shaped source/ticket data cannot execute or obtain credentials.
+
+The disposable proofs remain unmerged. Do not enable ordinary consumer reviews
+until the caller has the Dancer App secrets and both clean and inline readback
+receipts prove the exact actor. The thread readback added here exists only for
+publication identity and idempotency; superseded-thread resolution is a later,
+separate contract.
 
 Do not merge a disposable proof PR. Until the immutable pin and proof exist,
 this artifact is not merge authority.
