@@ -66,7 +66,6 @@ def graphql_thread(
         "originalStartLine": None,
         "diffSide": "RIGHT",
         "startDiffSide": None,
-        "originalDiffSide": "RIGHT",
         "subjectType": "LINE",
         "viewerCanResolve": True,
         "resolvedBy": None,
@@ -423,6 +422,45 @@ class ResolutionPrepareTests(unittest.TestCase):
         self.assertIsNotNone(normalized)
         self.assertEqual(normalized["line"], 7)
         self.assertTrue(normalized["is_outdated"])
+
+    def test_live_outdated_thread_shape_omits_unsupported_original_diff_side(self):
+        thread = graphql_thread(outdated=True)
+        thread.update(
+            {
+                "id": "PRRT_kwDOOl1N5c6Zb1nU",
+                "path": "lib/autonomy/fable-pr-disposition.ts",
+                "line": None,
+                "startLine": None,
+                "originalLine": 448,
+                "originalStartLine": None,
+            }
+        )
+
+        normalized = review_resolver.normalize_thread(thread)
+
+        self.assertNotIn("originalDiffSide", review_resolver.THREAD_QUERY)
+        self.assertNotIn("originalDiffSide", review_resolver.THREAD_READBACK_QUERY)
+        self.assertIsNotNone(normalized)
+        self.assertEqual(normalized["line"], 448)
+        self.assertEqual(normalized["side"], "RIGHT")
+
+    def test_outdated_range_defers_original_side_proof_to_exact_rest_comment(self):
+        thread = graphql_thread(outdated=True)
+        thread.update(
+            {
+                "line": None,
+                "startLine": None,
+                "originalLine": 9,
+                "originalStartLine": 7,
+            }
+        )
+
+        normalized = review_resolver.normalize_thread(thread)
+
+        self.assertIsNotNone(normalized)
+        self.assertEqual(normalized["line"], 9)
+        self.assertEqual(normalized["start_line"], 7)
+        self.assertEqual(normalized["start_side"], "RIGHT")
 
 
 class ResolutionProvenanceTests(unittest.TestCase):

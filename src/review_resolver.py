@@ -49,7 +49,6 @@ query CodexResolutionThreads($owner: String!, $name: String!, $number: Int!, $af
           originalStartLine
           diffSide
           startDiffSide
-          originalDiffSide
           subjectType
           comments(first: 2) {
             totalCount
@@ -81,7 +80,6 @@ query CodexResolutionThread($threadId: ID!) {
       originalStartLine
       diffSide
       startDiffSide
-      originalDiffSide
       subjectType
       viewerCanResolve
       resolvedBy {
@@ -214,7 +212,6 @@ def normalize_thread(thread: Any) -> dict[str, Any] | None:
         or type(thread.get("isOutdated")) is not bool
         or thread.get("subjectType") != "LINE"
         or thread.get("diffSide") not in {"RIGHT", None}
-        or thread.get("originalDiffSide") not in {"RIGHT", None}
         or not isinstance(thread.get("path"), str)
         or review_publication.safe_relative_path(thread["path"]) != thread["path"]
         or not isinstance(comments, dict)
@@ -240,11 +237,14 @@ def normalize_thread(thread: Any) -> dict[str, Any] | None:
     if type(line) is not int or line < 1:
         return None
     start_line = thread.get("startLine")
+    start_side = thread.get("startDiffSide")
     if start_line is None:
         start_line = thread.get("originalStartLine")
-    start_side = thread.get("startDiffSide")
-    if start_side is None and start_line is not None:
-        start_side = thread.get("originalDiffSide")
+        if start_line is not None:
+            # GitHub does not expose originalDiffSide on review threads. This
+            # provisional side is accepted only when exact REST evidence later
+            # proves original_side RIGHT for the Dancer root comment.
+            start_side = "RIGHT"
     if (start_line is None) != (start_side is None) or (
         start_line is not None
         and (
