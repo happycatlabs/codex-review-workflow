@@ -226,6 +226,8 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn('/pulls/{pull_number}/reviews"', publisher)
         self.assertIn('/pulls/{pull_number}/reviews/{review_id}"', publisher)
         self.assertIn('/reviews/{review_id}/comments"', publisher)
+        self.assertIn('/pulls/comments/{comment_id}"', publisher)
+        self.assertNotIn('/pulls/{pull_number}/comments"', publisher)
         self.assertIn("PUBLICATION_MARKER", publisher)
         self.assertIn("request_sha256", publisher)
         self.assertIn("PUBLICATION_READBACK_FAILED", publisher)

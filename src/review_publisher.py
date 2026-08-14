@@ -429,19 +429,36 @@ def validate_review_readback(
     if not actor_matches(review.get("user")):
         raise PublicationFailure("DANCER_ACTOR_MISMATCH")
 
-    comments = paginated_list(
+    comment_references = paginated_list(
         client,
         f"/repos/{owner}/{name}/pulls/{pull_number}/reviews/{review_id}/comments",
         max_pages=MAX_COMMENT_PAGES,
     )
     expected_comments = request.get("comments", [])
-    if not isinstance(expected_comments, list) or len(comments) != len(
+    if not isinstance(expected_comments, list) or len(comment_references) != len(
         expected_comments
     ):
         raise PublicationFailure("PUBLICATION_READBACK_FAILED")
-    for expected, actual in zip(expected_comments, comments):
+    comment_ids: set[int] = set()
+    for expected, reference in zip(expected_comments, comment_references):
+        comment_id = reference.get("id")
         if (
-            actual.get("pull_request_review_id") != review_id
+            type(comment_id) is not int
+            or comment_id < 1
+            or comment_id in comment_ids
+            or reference.get("pull_request_review_id") != review_id
+        ):
+            raise PublicationFailure("PUBLICATION_READBACK_FAILED")
+        comment_ids.add(comment_id)
+        actual = client.request(
+            "GET", f"/repos/{owner}/{name}/pulls/comments/{comment_id}"
+        )
+        if not isinstance(actual, dict):
+            raise PublicationFailure("PUBLICATION_READBACK_FAILED")
+        if (
+            actual.get("id") != comment_id
+            or actual.get("pull_request_review_id") != review_id
+            or actual.get("commit_id") != expected_commit
             or actual_comment(actual) != expected_comment(expected)
         ):
             raise PublicationFailure("PUBLICATION_READBACK_FAILED")

@@ -105,6 +105,11 @@ class FakeGitHubClient:
         self.accept_then_fail = False
         self.drop_comments_on_readback = False
         self.hidden_comment_readbacks = 0
+        self.overflow_comment_readback = False
+        self.corrupt_comment_reference: str | None = None
+        self.fail_exact_comment_readback_status: int | None = None
+        self.null_exact_comment_readbacks = 0
+        self.corrupt_exact_comment: str | None = None
         self.change_head_at_pull_read: int | None = None
         self.fail_commit_read_at: int | None = None
         self.fail_review_list = False
@@ -114,6 +119,8 @@ class FakeGitHubClient:
         self.comment_reads = 0
         self.review_read_paths: list[str] = []
         self.comment_read_paths: list[str] = []
+        self.comment_reference_readbacks: list[list[dict]] = []
+        self.exact_comment_read_paths: list[str] = []
 
     def request(self, method: str, path: str, payload=None):
         if method == "POST" and path == "/graphql":
@@ -172,11 +179,13 @@ class FakeGitHubClient:
             self.reviews.append(review)
             self.comments[review_id] = [
                 {
+                    "id": review_id * 100 + index,
                     **copy.deepcopy(comment),
                     "pull_request_review_id": review_id,
+                    "commit_id": payload.get("commit_id", self.head_sha),
                     "user": copy.deepcopy(self.actor),
                 }
-                for comment in payload.get("comments", [])
+                for index, comment in enumerate(payload.get("comments", []), start=1)
             ]
             if self.accept_then_fail:
                 self.accept_then_fail = False
@@ -186,6 +195,14 @@ class FakeGitHubClient:
             self.comment_read_paths.append(path)
             review_id = int(path.split("/reviews/", 1)[1].split("/", 1)[0])
             page = int(path.rsplit("page=", 1)[1])
+            if self.overflow_comment_readback:
+                return [
+                    {
+                        "id": review_id * 100_000 + page * 1_000 + index,
+                        "pull_request_review_id": review_id,
+                    }
+                    for index in range(review_publisher.PAGE_SIZE)
+                ]
             if page > 1:
                 return []
             self.comment_reads += 1
@@ -194,7 +211,53 @@ class FakeGitHubClient:
                 return []
             if self.drop_comments_on_readback:
                 return []
-            return copy.deepcopy(self.comments[review_id])
+            references = [
+                {
+                    "id": comment["id"],
+                    "pull_request_review_id": comment["pull_request_review_id"],
+                    "path": comment["path"],
+                    "position": 9,
+                    "original_position": 9,
+                }
+                for comment in self.comments[review_id]
+            ]
+            if references and self.corrupt_comment_reference == "id":
+                references[0]["id"] = "invalid"
+            if references and self.corrupt_comment_reference == "review":
+                references[0]["pull_request_review_id"] = review_id + 1
+            self.comment_reference_readbacks.append(copy.deepcopy(references))
+            return copy.deepcopy(references)
+        if method == "GET" and "/pulls/comments/" in path:
+            self.exact_comment_read_paths.append(path)
+            if self.fail_exact_comment_readback_status is not None:
+                raise review_publisher.GitHubApiError(
+                    self.fail_exact_comment_readback_status, "comment readback rejected"
+                )
+            if self.null_exact_comment_readbacks > 0:
+                self.null_exact_comment_readbacks -= 1
+                return None
+            comment_id = int(path.rsplit("/", 1)[1])
+            actual = copy.deepcopy(
+                next(
+                    comment
+                    for comments in self.comments.values()
+                    for comment in comments
+                    if comment["id"] == comment_id
+                )
+            )
+            if self.corrupt_exact_comment == "id":
+                actual["id"] = comment_id + 1
+            elif self.corrupt_exact_comment == "review":
+                actual["pull_request_review_id"] += 1
+            elif self.corrupt_exact_comment == "commit":
+                actual["commit_id"] = NEXT_HEAD_SHA
+            elif self.corrupt_exact_comment == "coordinates":
+                actual["line"] += 1
+            elif self.corrupt_exact_comment == "body":
+                actual["body"] += " changed"
+            elif self.corrupt_exact_comment == "actor":
+                actual["user"] = {"login": "github-actions[bot]", "id": 41898282}
+            return actual
         if method == "GET" and "/reviews/" in path:
             self.review_read_paths.append(path)
             if self.fail_review_readback:
@@ -343,7 +406,146 @@ class DancerPublisherTests(unittest.TestCase):
             ]
             * 5,
         )
+        self.assertEqual(
+            fake.exact_comment_read_paths,
+            ["/repos/happycatlabs/fable/pulls/comments/90101"],
+        )
         self.assertEqual(receipt["review"]["reused"], False)
+
+    def test_run_31840325453_resolves_modern_coordinates_by_exact_comment_id(self):
+        # GitHub's review-scoped comment list exposed only legacy position fields
+        # in the live run. The exact comment resource carried line/side evidence.
+        fake = FakeGitHubClient()
+
+        result, receipt = publish_with(fake, [finding()])
+
+        self.assertEqual(result["publication"]["status"], "published")
+        self.assertEqual(result["publication"]["mode"], "inline")
+        self.assertEqual(result["publication"]["inline_comment_count"], 1)
+        self.assertEqual(fake.post_count, 1)
+        reference = fake.comment_reference_readbacks[0][0]
+        self.assertEqual(reference["position"], 9)
+        self.assertNotIn("line", reference)
+        self.assertNotIn("side", reference)
+        review_id = receipt["review"]["id"]
+        comment_id = fake.comments[review_id][0]["id"]
+        self.assertEqual(
+            fake.exact_comment_read_paths,
+            [f"/repos/happycatlabs/fable/pulls/comments/{comment_id}"],
+        )
+
+    def test_invalid_review_comment_reference_fails_closed_without_reposting(self):
+        for corruption in ("id", "review"):
+            with self.subTest(corruption=corruption):
+                fake = FakeGitHubClient()
+                fake.corrupt_comment_reference = corruption
+
+                with patch.object(review_publisher.time, "sleep") as sleep:
+                    result, receipt = publish_with(fake, [finding()])
+
+                self.assertEqual(result["publication"]["status"], "failed")
+                self.assertEqual(
+                    result["publication"]["fallback_reason"],
+                    "PUBLICATION_READBACK_FAILED",
+                )
+                self.assertEqual(fake.post_count, 1)
+                self.assertEqual(fake.exact_comment_read_paths, [])
+                self.assertIsNone(receipt["review"])
+                self.assertEqual(
+                    sleep.call_count,
+                    len(review_publisher.READBACK_RETRY_DELAYS_SECONDS),
+                )
+
+    def test_review_comment_reference_overflow_fails_closed_without_reposting(self):
+        fake = FakeGitHubClient()
+        fake.overflow_comment_readback = True
+
+        with patch.object(review_publisher.time, "sleep") as sleep:
+            result, receipt = publish_with(fake, [finding()])
+
+        self.assertEqual(result["publication"]["status"], "failed")
+        self.assertEqual(
+            result["publication"]["fallback_reason"],
+            "PUBLICATION_EVIDENCE_LIMIT_EXCEEDED",
+        )
+        self.assertEqual(fake.post_count, 1)
+        self.assertEqual(fake.exact_comment_read_paths, [])
+        self.assertIsNone(receipt["review"])
+        sleep.assert_not_called()
+
+    def test_exact_comment_404_or_422_fails_after_one_mutation_without_retry(self):
+        for status in (404, 422):
+            with self.subTest(status=status):
+                fake = FakeGitHubClient()
+                fake.fail_exact_comment_readback_status = status
+
+                with patch.object(review_publisher.time, "sleep") as sleep:
+                    result, receipt = publish_with(fake, [finding()])
+
+                self.assertEqual(result["publication"]["status"], "failed")
+                self.assertEqual(
+                    result["publication"]["fallback_reason"],
+                    "PUBLICATION_STATE_LOOKUP_FAILED",
+                )
+                self.assertEqual(fake.post_count, 1)
+                self.assertEqual(len(fake.exact_comment_read_paths), 1)
+                self.assertIsNone(receipt["review"])
+                sleep.assert_not_called()
+
+    def test_exact_comment_evidence_exhaustion_never_reposts(self):
+        fake = FakeGitHubClient()
+        fake.null_exact_comment_readbacks = 100
+
+        with patch.object(review_publisher.time, "sleep") as sleep:
+            result, receipt = publish_with(fake, [finding()])
+
+        self.assertEqual(result["publication"]["status"], "failed")
+        self.assertEqual(
+            result["publication"]["fallback_reason"],
+            "PUBLICATION_READBACK_FAILED",
+        )
+        self.assertEqual(fake.post_count, 1)
+        self.assertEqual(
+            len(fake.exact_comment_read_paths),
+            len(review_publisher.READBACK_RETRY_DELAYS_SECONDS) + 1,
+        )
+        self.assertIsNone(receipt["review"])
+        self.assertEqual(
+            sleep.call_count,
+            len(review_publisher.READBACK_RETRY_DELAYS_SECONDS),
+        )
+
+    def test_exact_comment_identity_body_head_and_anchor_stay_strict(self):
+        for corruption in ("id", "review", "commit", "coordinates", "body"):
+            with self.subTest(corruption=corruption):
+                fake = FakeGitHubClient()
+                fake.corrupt_exact_comment = corruption
+
+                with patch.object(review_publisher.time, "sleep") as sleep:
+                    result, receipt = publish_with(fake, [finding()])
+
+                self.assertEqual(result["publication"]["status"], "failed")
+                self.assertEqual(fake.post_count, 1)
+                self.assertIsNone(receipt["review"])
+                self.assertEqual(
+                    sleep.call_count,
+                    len(review_publisher.READBACK_RETRY_DELAYS_SECONDS),
+                )
+
+    def test_exact_comment_actor_mismatch_fails_without_retry_or_fallback(self):
+        fake = FakeGitHubClient()
+        fake.corrupt_exact_comment = "actor"
+
+        with patch.object(review_publisher.time, "sleep") as sleep:
+            result, receipt = publish_with(fake, [finding()])
+
+        self.assertEqual(result["publication"]["status"], "failed")
+        self.assertEqual(
+            result["publication"]["fallback_reason"], "DANCER_ACTOR_MISMATCH"
+        )
+        self.assertEqual(fake.post_count, 1)
+        self.assertIsNone(receipt["review"])
+        sleep.assert_not_called()
 
     def test_identical_request_reuses_exact_review_and_comment_readback(self):
         fake = FakeGitHubClient()
