@@ -135,7 +135,11 @@ review id, request digest, exact observed generation, and idempotent-reuse
 status. After one successful review POST, bounded read-only evidence retries
 with at most 31 seconds of backoff allow GitHub's review/comment indexes to
 converge; they never repeat the mutation or relax actor, body, commit,
-coordinate, or `COMMENTED` validation.
+coordinate, or `COMMENTED` validation. The review-scoped comment collection is
+used only as a bounded index of exact comment ids. Each indexed comment is then
+read from its exact resource so modern `line` and `side` evidence is available
+for strict validation; the publisher never broadens to the PR-wide comment
+collection.
 A line-addressable finding becomes a resolvable inline thread only when its
 model-supplied file/range matches right-side added lines in the exact diff.
 Model output never chooses GitHub `side`, diff position, or review event. If
