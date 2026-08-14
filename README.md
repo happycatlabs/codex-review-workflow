@@ -13,9 +13,9 @@ The V2 workflow has five jobs:
    credentials, then seal the model prompt after those credentials leave scope;
 4. run Codex with no source checkout and both execution tools disabled;
 5. refetch the PR snapshot, verify immutable workflow provenance, derive
-   commentable lines from the exact diff in trusted code, and publish one
-   `COMMENT` review plus a machine artifact before failing closed unless the
-   result is clean.
+   commentable lines from the exact diff in trusted code, mint one repository-
+   scoped Dancer installation token, and publish one verified `COMMENT` review
+   plus machine evidence before failing closed unless the result is clean.
 
 ## Consumer setup
 
@@ -33,7 +33,7 @@ on:
 permissions:
   actions: read
   contents: read
-  pull-requests: write
+  pull-requests: read
   issues: read
 
 jobs:
@@ -44,6 +44,8 @@ jobs:
       CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
       LINEAR_CLIENT_ID: ${{ secrets.LINEAR_CLIENT_ID }}
       LINEAR_CLIENT_SECRET: ${{ secrets.LINEAR_CLIENT_SECRET }}
+      DANCER_APP_ID: ${{ secrets.DANCER_APP_ID }}
+      DANCER_PRIVATE_KEY: ${{ secrets.DANCER_PRIVATE_KEY }}
     with:
       allow-bot-users: dancer-automation[bot],dependabot[bot]
       linear-team-key: FABLE
@@ -68,6 +70,15 @@ result is `AUTH_LEGACY_UNSAFE` and Codex does not run. Pass only these named
 secrets; do not use `secrets: inherit` for the credential-bearing review job.
 If Dependabot updates the immutable workflow pin, list `dependabot[bot]`
 explicitly alongside the automation actor so its update PR can be reviewed.
+
+Set `DANCER_APP_ID` and `DANCER_PRIVATE_KEY` only in the caller repository's
+secret store. The private key is passed directly to the pinned official token
+broker in the trusted publish job; it is never placed in an environment
+variable, artifact, source checkout, intent job, or model job. The broker mints
+a short-lived token scoped to the current repository with `contents: read` and
+`pull-requests: write`, then revokes it after the job. Missing or invalid Dancer
+authority fails publication without falling back to `${{ github.token }}` or a
+human token.
 
 ## Inputs
 
@@ -113,7 +124,11 @@ ineligible state, not an infrastructure failure. The review is reported as
 skipped and automatic approval remains disabled; all machine gates continue to
 fail closed.
 
-The publisher uploads `codex-review-result/codex-review-result.json`. A
+The publisher uploads the unchanged v3
+`codex-review-result/codex-review-result.json` plus a bounded
+`codex-review-publication/v1` receipt containing the verified Dancer actor,
+review id, request digest, exact observed generation, and idempotent-reuse
+status. A
 line-addressable finding becomes a resolvable inline thread only when its
 model-supplied file/range matches right-side added lines in the exact diff.
 Model output never chooses GitHub `side`, diff position, or review event. If
@@ -121,6 +136,16 @@ any finding cannot be anchored, the result exceeds the 20-comment publication
 limit, the generation changes, or GitHub rejects the inline review, the
 publisher submits one complete summary `COMMENT` review instead. Findings are
 never partially published or discarded.
+
+Public reviews use a deterministic risk-first layout: `## Codex review`, a
+GitHub `NOTE` or `CAUTION` callout, `### Production impact`, and `### Evidence`.
+Every structured code location is an immutable exact-head blob link. Finding
+fingerprints remain in the v3 machine result and never appear in public prose.
+Before mutation the publisher revalidates the open PR, head, base ref, base
+SHA, and current default-branch SHA. It also reads back the Dancer-authored
+review and every inline comment. An exact hidden request marker makes response
+recovery and identical reruns idempotent; it does not resolve or alter any old
+thread.
 
 See
 [`codex-code-review.md`](codex-code-review.md) for the schema, trust boundaries,

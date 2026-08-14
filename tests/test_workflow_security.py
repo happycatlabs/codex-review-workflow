@@ -13,7 +13,9 @@ SOURCE = ROOT / "src/source_context.py"
 INTENT = ROOT / "src/intent_context.py"
 SCHEMA = ROOT / "src/codex-output-schema.json"
 PUBLICATION = ROOT / "src/review_publication.py"
+PUBLISHER = ROOT / "src/review_publisher.py"
 CODEX_ACTION_SHA = "52fe01ec70a42f454c9d2ebd47598f9fd6893d56"
+APP_TOKEN_ACTION_SHA = "bcd2ba49218906704ab6c1aa796996da409d3eb1"
 EXPECTED_WORKFLOW_PATH = (
     "happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml"
 )
@@ -81,6 +83,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertNotIn("actions/checkout", review)
         self.assertNotIn("LINEAR_CLIENT", review)
         self.assertNotIn("LINEAR_CLIENT", publish)
+        self.assertNotIn("DANCER_", review)
         self.assertIn("LINEAR_CLIENT_ID: ${{ secrets.LINEAR_CLIENT_ID }}", intent)
         self.assertIn(
             "LINEAR_CLIENT_SECRET: ${{ secrets.LINEAR_CLIENT_SECRET }}", intent
@@ -188,34 +191,54 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn('if [ "${verdict}" != clean ]', publish)
         self.assertIn('[ "${publication}" != published ]', publish)
 
-    def test_publication_uses_comment_review_json_without_file_expansion(self):
+    def test_publication_uses_brokered_dancer_token_without_actions_fallback(self):
         publish = self.job("publish")
+        publisher = PUBLISHER.read_text()
         self.assertIn(
-            'gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews"', publish
+            f"uses: actions/create-github-app-token@{APP_TOKEN_ACTION_SHA}", publish
         )
-        self.assertIn('--input "${input}"', publish)
-        self.assertNotIn("--raw-field", publish)
-        self.assertNotIn("--field", publish)
-        self.assertNotIn("/issues/${PR_NUMBER}/comments", publish)
-        self.assertIn("GITHUB_422", publish)
-        self.assertIn("STALE_BEFORE_PUBLICATION", publish)
+        self.assertIn("permission-contents: read", publish)
+        self.assertIn("permission-pull-requests: write", publish)
+        self.assertIn("pull-requests: read", publish)
         self.assertIn(
-            "fallback_reason=INLINE_PUBLICATION_FAILED\n              inline_count=0",
-            publish,
+            "DANCER_GITHUB_TOKEN: ${{ steps.dancer-token.outputs.token }}", publish
         )
-        self.assertGreaterEqual(publish.count("refresh_generation_state"), 3)
-        self.assertNotIn("APPROVE", publish)
-        self.assertNotIn("REQUEST_CHANGES", publish)
+        dancer_step = publish.split(
+            "      - name: Revalidate and publish Dancer COMMENT review\n", 1
+        )[1].split("\n      - name: Upload exact-head machine result\n", 1)[0]
+        self.assertNotIn("github.token", dancer_step)
+        self.assertNotIn("GH_TOKEN", dancer_step)
+        self.assertIn("DANCER_PRIVATE_KEY:", self.workflow)
+        self.assertNotIn("DANCER_PRIVATE_KEY", self.job("review", "publish"))
+        self.assertIn('"event": "COMMENT"', PUBLICATION.read_text())
+        self.assertIn('"COMMENTED"', publisher)
+        self.assertIn("EXPECTED_DANCER_LOGIN", publisher)
+        self.assertIn("EXPECTED_DANCER_ACTOR_ID", publisher)
+        self.assertIn("GITHUB_422", publisher)
+        self.assertIn("STALE_BEFORE_PUBLICATION", publisher)
+        self.assertNotIn("APPROVE", publisher)
+        self.assertNotIn("REQUEST_CHANGES", publisher)
         self.assertNotIn("issues: write", publish)
+
+    def test_publisher_reads_identified_review_and_inline_comment_evidence(self):
+        publisher = PUBLISHER.read_text()
+        self.assertIn('/pulls/{pull_number}/reviews"', publisher)
+        self.assertIn('/pulls/{pull_number}/reviews/{review_id}"', publisher)
+        self.assertIn('/reviews/{review_id}/comments"', publisher)
+        self.assertIn("PUBLICATION_MARKER", publisher)
+        self.assertIn("request_sha256", publisher)
+        self.assertIn("PUBLICATION_READBACK_FAILED", publisher)
+        self.assertIn("current_generation(client, repository, pull_number) != observed", publisher)
+        self.assertIn("publication-receipt.json", self.workflow)
 
     def test_missing_publication_helper_fails_without_posting_partial_summary(self):
         publish = self.job("publish")
         fallback = publish.split(
             "      - name: Plan COMMENT review publication\n", 1
-        )[1].split("\n      - name: Revalidate and publish COMMENT review\n", 1)[0]
+        )[1].split("\n      - name: Mint repository-scoped Dancer publisher token\n", 1)[0]
         self.assertIn('status:"failed"', fallback)
         self.assertIn('code:"COMMENT_HELPER_MISSING"', fallback)
-        self.assertIn('if [ "${planned_status}" = failed ]', publish)
+        self.assertIn('fallback_reason:"COMMENT_HELPER_MISSING"', publish)
 
     def test_model_cannot_choose_github_review_coordinates_or_event(self):
         schema = SCHEMA.read_text()
@@ -225,6 +248,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             self.assertIn(required, schema)
         self.assertIn('"event": "COMMENT"', PUBLICATION.read_text())
         self.assertIn('"side": "RIGHT"', PUBLICATION.read_text())
+        self.assertNotIn("Fingerprint:", PUBLICATION.read_text())
 
     def test_docs_keep_base_controlled_caller_and_no_incremental_state(self):
         docs = README.read_text() + ARCHITECTURE.read_text()
@@ -235,7 +259,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         )
         for stale in ("prior-review.json", "LAST_REVIEWED_SHA", "minimizeComment"):
             self.assertNotIn(stale, self.workflow)
-        self.assertIn("Revalidate and publish COMMENT review", self.workflow)
+        self.assertIn("Revalidate and publish Dancer COMMENT review", self.workflow)
 
 
 if __name__ == "__main__":
