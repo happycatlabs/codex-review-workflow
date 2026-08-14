@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,7 @@ MAX_REVIEW_PAGES = 10
 MAX_COMMENT_PAGES = 2
 PAGE_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 30
+READBACK_RETRY_DELAYS_SECONDS = (1, 2, 4)
 PUBLICATION_MARKER = "codex-review-publication/v1"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
@@ -465,6 +467,34 @@ def validate_review_readback(
     )
 
 
+def validate_posted_review_readback(
+    client: GitHubClient,
+    repository: str,
+    pull_number: int,
+    request: dict[str, Any],
+    request_sha256: str,
+    review_id: int,
+    observed_head: str,
+) -> PublishedReview:
+    for retry_delay in (*READBACK_RETRY_DELAYS_SECONDS, None):
+        try:
+            return validate_review_readback(
+                client,
+                repository,
+                pull_number,
+                request,
+                request_sha256,
+                review_id,
+                observed_head,
+                reused=False,
+            )
+        except PublicationFailure as error:
+            if error.reason != "PUBLICATION_READBACK_FAILED" or retry_delay is None:
+                raise
+            time.sleep(retry_delay)
+    raise AssertionError("unreachable readback retry state")
+
+
 def publish_one_review(
     client: GitHubClient,
     repository: str,
@@ -521,7 +551,7 @@ def publish_one_review(
     review_id = response.get("id") if isinstance(response, dict) else None
     if type(review_id) is not int or review_id < 1:
         raise PublicationFailure("PUBLICATION_READBACK_FAILED")
-    return validate_review_readback(
+    return validate_posted_review_readback(
         client,
         repository,
         pull_number,
@@ -529,7 +559,6 @@ def publish_one_review(
         digest,
         review_id,
         observed_head,
-        reused=False,
     )
 
 

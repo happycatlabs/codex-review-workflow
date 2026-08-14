@@ -132,8 +132,10 @@ The publisher uploads the unchanged v3
 `codex-review-result/codex-review-result.json` plus a bounded
 `codex-review-publication/v1` receipt containing the verified Dancer actor,
 review id, request digest, exact observed generation, and idempotent-reuse
-status. A
-line-addressable finding becomes a resolvable inline thread only when its
+status. After one successful review POST, bounded read-only evidence retries
+allow GitHub's review/comment indexes to converge; they never repeat the
+mutation or relax actor, body, commit, coordinate, or `COMMENTED` validation.
+A line-addressable finding becomes a resolvable inline thread only when its
 model-supplied file/range matches right-side added lines in the exact diff.
 Model output never chooses GitHub `side`, diff position, or review event. If
 any finding cannot be anchored, the result exceeds the 20-comment publication

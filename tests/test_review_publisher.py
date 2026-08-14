@@ -104,12 +104,14 @@ class FakeGitHubClient:
         self.inline_422_once = False
         self.accept_then_fail = False
         self.drop_comments_on_readback = False
+        self.hidden_comment_readbacks = 0
         self.change_head_at_pull_read: int | None = None
         self.fail_commit_read_at: int | None = None
         self.fail_review_list = False
         self.fail_review_readback = False
         self.pull_reads = 0
         self.commit_reads = 0
+        self.comment_reads = 0
 
     def request(self, method: str, path: str, payload=None):
         if method == "POST" and path == "/graphql":
@@ -182,6 +184,10 @@ class FakeGitHubClient:
             review_id = int(path.split("/reviews/", 1)[1].split("/", 1)[0])
             page = int(path.rsplit("page=", 1)[1])
             if page > 1:
+                return []
+            self.comment_reads += 1
+            if self.hidden_comment_readbacks > 0:
+                self.hidden_comment_readbacks -= 1
                 return []
             if self.drop_comments_on_readback:
                 return []
@@ -281,6 +287,25 @@ class DancerPublisherTests(unittest.TestCase):
         review_id = receipt["review"]["id"]
         self.assertEqual(fake.comments[review_id][0]["user"], fake.actor)
         self.assertNotIn(finding()["fingerprint"], fake.comments[review_id][0]["body"])
+
+    def test_run_31836590886_comment_readback_retries_without_reposting(self):
+        # The live POST persisted both records, but GitHub's first comment-list GET
+        # omitted the new inline comment before the same evidence became visible.
+        fake = FakeGitHubClient()
+        fake.hidden_comment_readbacks = 1
+
+        with patch.object(review_publisher.time, "sleep") as sleep:
+            result, receipt = publish_with(fake, [finding()])
+
+        self.assertEqual(result["publication"]["status"], "published")
+        self.assertEqual(result["publication"]["mode"], "inline")
+        self.assertEqual(result["publication"]["inline_comment_count"], 1)
+        self.assertEqual(fake.post_count, 1)
+        self.assertEqual(fake.comment_reads, 2)
+        sleep.assert_called_once_with(
+            review_publisher.READBACK_RETRY_DELAYS_SECONDS[0]
+        )
+        self.assertEqual(receipt["review"]["reused"], False)
 
     def test_identical_request_reuses_exact_review_and_comment_readback(self):
         fake = FakeGitHubClient()
@@ -431,25 +456,37 @@ class DancerPublisherTests(unittest.TestCase):
         fake = FakeGitHubClient()
         fake.fail_review_readback = True
 
-        result, receipt = publish_with(fake, [finding()])
+        with patch.object(review_publisher.time, "sleep") as sleep:
+            result, receipt = publish_with(fake, [finding()])
 
         self.assertEqual(result["publication"]["status"], "failed")
         self.assertEqual(fake.post_count, 1)
         self.assertEqual(len(fake.reviews[0].get("body", "")) > 0, True)
         self.assertEqual(len(fake.reviews), 1)
         self.assertIsNone(receipt["review"])
+        sleep.assert_not_called()
 
     def test_missing_inline_comment_readback_fails_closed(self):
         fake = FakeGitHubClient()
         fake.drop_comments_on_readback = True
 
-        result, receipt = publish_with(fake, [finding()])
+        with patch.object(review_publisher.time, "sleep") as sleep:
+            result, receipt = publish_with(fake, [finding()])
 
         self.assertEqual(result["publication"]["status"], "failed")
         self.assertEqual(
             result["publication"]["fallback_reason"], "PUBLICATION_READBACK_FAILED"
         )
+        self.assertEqual(fake.post_count, 1)
+        self.assertEqual(
+            fake.comment_reads,
+            len(review_publisher.READBACK_RETRY_DELAYS_SECONDS) + 1,
+        )
         self.assertIsNone(receipt["review"])
+        self.assertEqual(
+            sleep.call_count,
+            len(review_publisher.READBACK_RETRY_DELAYS_SECONDS),
+        )
 
     def test_generation_change_during_evidence_read_uses_stale_summary(self):
         fake = FakeGitHubClient()
