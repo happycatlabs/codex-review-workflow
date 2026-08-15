@@ -216,16 +216,14 @@ class FakeGitHub:
                 if self.resolve_on_error:
                     self.thread["isResolved"] = True
                     self.thread["resolvedBy"] = {
-                        "login": review_resolver.GRAPHQL_DANCER_LOGIN,
-                        "databaseId": review_publisher.EXPECTED_DANCER_ACTOR_ID,
+                        "login": "informational-user",
                     }
                 raise review_resolver.GitHubApiError(
                     self.mutation_error_status, "response lost"
                 )
             self.thread["isResolved"] = True
             self.thread["resolvedBy"] = {
-                "login": review_resolver.GRAPHQL_DANCER_LOGIN,
-                "databaseId": review_publisher.EXPECTED_DANCER_ACTOR_ID,
+                "login": "informational-user",
             }
             return {
                 "resolveReviewThread": {
@@ -700,6 +698,24 @@ class ResolutionApplyTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "completed")
         self.assertEqual(fake.mutation_calls, 1)
         self.assertTrue(receipt["results"][0]["is_resolved"])
+        self.assertEqual(
+            receipt["actor"],
+            {
+                "login": review_publisher.EXPECTED_DANCER_LOGIN,
+                "id": review_publisher.EXPECTED_DANCER_ACTOR_ID,
+            },
+        )
+
+    def test_live_schema_uses_only_user_shaped_resolved_by_evidence(self):
+        self.assertIn(
+            "resolvedBy {\n        login\n      }",
+            review_resolver.THREAD_READBACK_QUERY,
+        )
+        self.assertIn(
+            "resolvedBy {\n        login\n      }", review_resolver.RESOLVE_MUTATION
+        )
+        self.assertNotIn("... on Bot", review_resolver.THREAD_READBACK_QUERY)
+        self.assertNotIn("... on Bot", review_resolver.RESOLVE_MUTATION)
 
     def test_ambiguous_response_reads_back_without_retry(self):
         current, _, fake, packet, plan = prepared_state()

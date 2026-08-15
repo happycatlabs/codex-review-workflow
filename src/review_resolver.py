@@ -84,7 +84,6 @@ query CodexResolutionThread($threadId: ID!) {
       viewerCanResolve
       resolvedBy {
         login
-        ... on Bot { databaseId }
       }
       comments(first: 2) {
         totalCount
@@ -109,7 +108,6 @@ mutation CodexResolveReviewThread($threadId: ID!, $clientMutationId: String!) {
       isResolved
       resolvedBy {
         login
-        ... on Bot { databaseId }
       }
     }
   }
@@ -345,14 +343,6 @@ def read_thread_node(client: GitHubClient, thread_id: str) -> dict[str, Any] | N
 
 def read_thread(client: GitHubClient, thread_id: str) -> dict[str, Any] | None:
     return normalize_thread(read_thread_node(client, thread_id))
-
-
-def graphql_dancer_actor(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and value.get("login") == GRAPHQL_DANCER_LOGIN
-        and value.get("databaseId") == review_publisher.EXPECTED_DANCER_ACTOR_ID
-    )
 
 
 def _artifact_pair(raw: bytes) -> tuple[dict[str, Any], dict[str, Any]] | None:
@@ -1319,7 +1309,6 @@ def apply(
                     or not isinstance(mutated, dict)
                     or mutated.get("id") != thread_id
                     or mutated.get("isResolved") is not True
-                    or not graphql_dancer_actor(mutated.get("resolvedBy"))
                 ):
                     raise ResolutionFailure("RESOLUTION_MUTATION_INVALID")
             except GitHubApiError as error:
@@ -1333,7 +1322,6 @@ def apply(
                 not isinstance(node, dict)
                 or node.get("id") != thread_id
                 or node.get("isResolved") is not True
-                or not graphql_dancer_actor(node.get("resolvedBy"))
             ):
                 raise ResolutionFailure("RESOLUTION_READBACK_FAILED")
             unresolved_shape = copy.deepcopy(node)
