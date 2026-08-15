@@ -183,7 +183,11 @@ scoped Dancer App token immediately before its one-shot mutation. GitHub types
 `PullRequestReviewThread.resolvedBy` as `User`, so that field is informational
 only and is never used or reported as Dancer identity. The exact client
 mutation id, resolved thread id/state readback, and generation rechecks prove
-the mutation outcome.
+the mutation outcome. GitHub rejects `resolveReviewThread` for an App token
+limited to `contents: read` even when `viewerCanResolve` is true, so the
+conditionally minted resolver token requests `contents: write` and
+`pull-requests: write`. The independent publisher token remains limited to
+`contents: read` and `pull-requests: write`.
 
 See
 [`codex-code-review.md`](codex-code-review.md) for the schema, trust boundaries,

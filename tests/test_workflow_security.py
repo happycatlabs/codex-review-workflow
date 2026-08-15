@@ -217,11 +217,17 @@ class WorkflowSecurityTests(unittest.TestCase):
     def test_publication_uses_brokered_dancer_token_without_actions_fallback(self):
         publish = self.job("publish", "resolution-prepare")
         publisher = PUBLISHER.read_text()
+        publisher_token = publish.split(
+            "      - name: Mint repository-scoped Dancer publisher token\n", 1
+        )[1].split(
+            "\n      - name: Revalidate and publish Dancer COMMENT review\n", 1
+        )[0]
         self.assertIn(
             f"uses: actions/create-github-app-token@{APP_TOKEN_ACTION_SHA}", publish
         )
-        self.assertIn("permission-contents: read", publish)
-        self.assertIn("permission-pull-requests: write", publish)
+        self.assertIn("permission-contents: read", publisher_token)
+        self.assertNotIn("permission-contents: write", publisher_token)
+        self.assertIn("permission-pull-requests: write", publisher_token)
         self.assertIn("pull-requests: read", publish)
         self.assertIn(
             "DANCER_GITHUB_TOKEN: ${{ steps.dancer-token.outputs.token }}", publish
@@ -298,7 +304,14 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn(
             f"uses: actions/create-github-app-token@{APP_TOKEN_ACTION_SHA}", apply
         )
-        self.assertIn("permission-pull-requests: write", apply)
+        resolver_token = apply.split(
+            "      - name: Mint repository-scoped Dancer resolver token\n", 1
+        )[1].split(
+            "\n      - name: Revalidate and apply fixed thread mutations\n", 1
+        )[0]
+        self.assertIn("permission-contents: write", resolver_token)
+        self.assertNotIn("permission-contents: read", resolver_token)
+        self.assertIn("permission-pull-requests: write", resolver_token)
         self.assertIn("codex-review-resolution-receipt.json", apply)
         self.assertNotIn("codex-review-result.json.tmp", apply)
         self.assertIn("MAX_CANDIDATES = 20", contract)
