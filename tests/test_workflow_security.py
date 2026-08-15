@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import pathlib
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -313,6 +317,38 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", apply_step)
         self.assertIn("DANCER_GITHUB_TOKEN:", apply_step)
         self.assertNotIn("minimizeComment", resolver)
+
+    def test_sealed_resolution_helpers_include_importable_dependencies(self):
+        prepare = self.job("resolution-prepare", "resolution-review")
+        trusted_sources = (
+            RESOLUTION,
+            RESOLVER,
+            PUBLICATION,
+            PUBLISHER,
+            CONTRACT,
+            INTENT,
+            SOURCE,
+        )
+        for source in trusted_sources:
+            self.assertIn(
+                f'cp trusted-workflow/src/{source.name} "${{RESOLUTION_INPUT}}/trusted/"',
+                prepare,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            trusted = pathlib.Path(directory) / "trusted"
+            trusted.mkdir()
+            for source in trusted_sources:
+                shutil.copy2(source, trusted / source.name)
+            for helper in ("review_resolution.py", "review_resolver.py"):
+                result = subprocess.run(
+                    [sys.executable, str(trusted / helper), "--help"],
+                    cwd=trusted,
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_docs_keep_base_controlled_caller_and_no_incremental_state(self):
         docs = README.read_text() + ARCHITECTURE.read_text()

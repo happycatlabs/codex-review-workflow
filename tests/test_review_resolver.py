@@ -347,6 +347,9 @@ class ResolutionPrepareTests(unittest.TestCase):
                 dancer_token="",
             )
         self.assertEqual(fake.mutation_calls, 0)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["resolve_count"], 0)
+        self.assertIsNone(receipt["actor"])
         self.assertEqual(receipt["observations"][0]["is_resolved"], False)
 
     def test_missing_prior_artifact_is_untouched(self):
@@ -435,14 +438,124 @@ class ResolutionPrepareTests(unittest.TestCase):
                 "originalStartLine": None,
             }
         )
+        thread["comments"]["nodes"][0].update(
+            {
+                "id": "PRRC_kwDOOl1N5c7hwrKg",
+                "fullDatabaseId": "3787633312",
+            }
+        )
+        rest_comment = {
+            "id": 3787633312,
+            "node_id": "PRRC_kwDOOl1N5c7hwrKg",
+            "pull_request_review_id": 4941742767,
+            "in_reply_to_id": None,
+            "user": {
+                "login": review_publisher.EXPECTED_DANCER_LOGIN,
+                "id": review_publisher.EXPECTED_DANCER_ACTOR_ID,
+            },
+            "body": "trusted finding body",
+            "path": "lib/autonomy/fable-pr-disposition.ts",
+            "line": None,
+            "side": "RIGHT",
+            "original_line": 448,
+            "original_side": None,
+            "start_line": None,
+            "start_side": None,
+            "original_start_line": None,
+            "commit_id": "30a18b432d9234e200019b6713efc951a0d785d4",
+            "original_commit_id": "30a18b432d9234e200019b6713efc951a0d785d4",
+        }
 
         normalized = review_resolver.normalize_thread(thread)
+        rest = review_resolver._modern_comment_snapshot(rest_comment)
 
         self.assertNotIn("originalDiffSide", review_resolver.THREAD_QUERY)
         self.assertNotIn("originalDiffSide", review_resolver.THREAD_READBACK_QUERY)
         self.assertIsNotNone(normalized)
+        self.assertIsNotNone(rest)
         self.assertEqual(normalized["line"], 448)
         self.assertEqual(normalized["side"], "RIGHT")
+        self.assertEqual(rest["line"], normalized["line"])
+        self.assertEqual(rest["side"], normalized["side"])
+        self.assertEqual(rest["path"], normalized["path"])
+        self.assertEqual(rest["id"], normalized["comment"]["database_id"])
+        self.assertEqual(rest["node_id"], normalized["comment"]["id"])
+
+    def test_live_outdated_comment_preserves_proven_right_side(self):
+        current = publication_pair([], head=HEAD_SHA, run_id=RUN_ID, review_id=900)
+        prior = publication_pair(
+            [finding()], head=PRIOR_HEAD, run_id=PRIOR_RUN_ID, review_id=PRIOR_REVIEW_ID
+        )
+        fake = FakeGitHub(current, prior)
+        fake.thread = graphql_thread(outdated=True)
+        fake.thread.update(
+            {
+                "id": "PRRT_kwDOOl1N5c6Zb1nU",
+                "line": None,
+                "originalLine": 7,
+            }
+        )
+        fake.comment.update(
+            {
+                "line": None,
+                "side": "RIGHT",
+                "original_line": 7,
+                "original_side": None,
+            }
+        )
+
+        with (
+            patch.object(review_resolver, "GitHubClient", return_value=fake),
+            patch.object(
+                review_resolver,
+                "collect_provenance",
+                return_value=[
+                    review_resolution.validate_inline_provenance(
+                        prior[0],
+                        prior[1],
+                        repository=REPOSITORY,
+                        pull_number=PULL_NUMBER,
+                    )
+                ],
+            ),
+        ):
+            packet = review_resolver.prepare(
+                repository=REPOSITORY,
+                pull_number=PULL_NUMBER,
+                run_id=RUN_ID,
+                workflow_sha="e" * 40,
+                current_result=current[0],
+                current_receipt=current[1],
+                token="read-token",
+            )
+
+        self.assertEqual(packet["status"], "ready")
+        self.assertEqual(packet["candidate_count"], 1)
+        self.assertEqual(packet["candidates"][0]["thread_id"], fake.thread["id"])
+        self.assertEqual(packet["candidates"][0]["comment_snapshot"]["line"], 7)
+        self.assertEqual(
+            packet["candidates"][0]["comment_snapshot"]["side"], "RIGHT"
+        )
+
+    def test_outdated_comment_side_evidence_fails_closed(self):
+        current = publication_pair([], head=HEAD_SHA, run_id=RUN_ID, review_id=900)
+        prior = publication_pair(
+            [finding()], head=PRIOR_HEAD, run_id=PRIOR_RUN_ID, review_id=PRIOR_REVIEW_ID
+        )
+        base = FakeGitHub(current, prior).comment
+        base.update({"line": None, "original_line": 7})
+
+        variants = (
+            {"side": "LEFT", "original_side": None},
+            {"side": "RIGHT", "original_side": "LEFT"},
+            {"side": None, "original_side": None},
+            {"side": "RIGHT", "original_side": None, "original_line": None},
+        )
+        for changes in variants:
+            with self.subTest(changes=changes):
+                comment = copy.deepcopy(base)
+                comment.update(changes)
+                self.assertIsNone(review_resolver._modern_comment_snapshot(comment))
 
     def test_outdated_range_defers_original_side_proof_to_exact_rest_comment(self):
         thread = graphql_thread(outdated=True)
