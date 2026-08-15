@@ -576,7 +576,9 @@ def _modern_comment_snapshot(comment: Any) -> dict[str, Any] | None:
     side = comment.get("side")
     if type(line) is not int or line < 1:
         line = comment.get("original_line")
-        side = comment.get("original_side")
+        original_side = comment.get("original_side")
+        if original_side is not None:
+            side = original_side
     if type(line) is not int or line < 1 or side != "RIGHT":
         return None
     start_line = comment.get("start_line")
@@ -584,7 +586,8 @@ def _modern_comment_snapshot(comment: Any) -> dict[str, Any] | None:
     if start_line is None:
         start_line = comment.get("original_start_line")
     if start_side is None and start_line is not None:
-        start_side = comment.get("original_side")
+        original_side = comment.get("original_side")
+        start_side = side if original_side is None else original_side
     if (start_line is None) != (start_side is None) or (
         start_line is not None
         and (

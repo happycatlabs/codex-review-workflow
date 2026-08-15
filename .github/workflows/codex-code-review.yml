@@ -1083,6 +1083,8 @@ jobs:
           cp trusted-workflow/src/review_publication.py "${RESOLUTION_INPUT}/trusted/"
           cp trusted-workflow/src/review_publisher.py "${RESOLUTION_INPUT}/trusted/"
           cp trusted-workflow/src/review_contract.py "${RESOLUTION_INPUT}/trusted/"
+          cp trusted-workflow/src/intent_context.py "${RESOLUTION_INPUT}/trusted/"
+          cp trusted-workflow/src/source_context.py "${RESOLUTION_INPUT}/trusted/"
           cp trusted-workflow/src/codex-resolution-output-schema.json \
             "${RESOLUTION_INPUT}/model-workspace/codex-resolution-output-schema.json"
           python3 trusted-workflow/src/review_resolver.py prepare \
