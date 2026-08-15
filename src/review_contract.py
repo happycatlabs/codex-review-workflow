@@ -44,6 +44,7 @@ EXPECTED_WORKFLOW_PATH = (
 BLOCKING_SEVERITIES = {"CRITICAL", "BUG"}
 PREPARATION_ERROR_CODES = {
     "BASE_NOT_ANCESTOR",
+    "BASE_PROVENANCE_INVALID",
     "PREPARE_FAILED",
     "SOURCE_CONTEXT_FAILED",
     "SOURCE_CONTEXT_STALE",
@@ -105,6 +106,8 @@ ERROR_REASONS = {
     "PR_STATE_LOOKUP_FAILED": "The current pull request and default branch could not be verified.",
     "PR_STATE_INVALID": "The pull request is no longer open.",
     "BASE_BRANCH_INVALID": "The pull request does not target the current default branch.",
+    "BASE_PROVENANCE_INVALID": "The pull request base provenance could not be proven.",
+    "BASE_PROVENANCE_DRIFT": "The pull request stack topology changed after review preparation.",
     "BASE_REF_DRIFT": "The pull request base branch changed after review preparation.",
     "HEAD_LOOKUP_FAILED": "The current pull request head could not be verified.",
     "STALE_HEAD": "The pull request head changed after review preparation.",
@@ -1223,6 +1226,7 @@ def finalize(
     coverage_path: pathlib.Path,
     lookup_context_path: pathlib.Path,
     review_input_path: pathlib.Path,
+    base_provenance_path: pathlib.Path,
     current_pr_path: pathlib.Path,
     provenance_path: pathlib.Path,
     reviewer_revision: str,
@@ -1239,6 +1243,10 @@ def finalize(
         packets = ["general"]
         packets_valid = False
     review_input, review_input_valid = load_review_input(review_input_path)
+    try:
+        prepared_base_provenance = load_json(base_provenance_path)
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):
+        prepared_base_provenance = None
     coverage, coverage_valid = load_coverage(coverage_path)
     lookup_context, lookup_context_valid = load_lookup_context(
         lookup_context_path, review_input
@@ -1277,6 +1285,8 @@ def finalize(
 
     if not review_input_valid:
         return fail("PREPARE_FAILED", "")
+    if not isinstance(prepared_base_provenance, dict):
+        return fail("BASE_PROVENANCE_INVALID", "")
     if not packets_valid:
         return fail("PREPARE_FAILED", "")
     if (
@@ -1296,12 +1306,17 @@ def finalize(
         return fail("PR_STATE_INVALID")
     current_base_ref = current.get("base_ref", "")
     current_default_branch = current.get("default_branch", "")
-    if current_base_ref != current_default_branch:
-        return fail("BASE_BRANCH_INVALID")
+    current_base_provenance = current.get("base_provenance")
+    if not isinstance(current_base_provenance, dict):
+        return fail("BASE_PROVENANCE_INVALID")
+    if current_base_provenance != prepared_base_provenance:
+        return fail("BASE_PROVENANCE_DRIFT")
     if (
-        current_base_ref != review_input["base_ref"]
-        or current_default_branch != review_input["base_ref"]
+        current_base_ref != current_default_branch
+        and current_base_provenance.get("mode") != "stacked"
     ):
+        return fail("BASE_BRANCH_INVALID")
+    if current_base_ref != review_input["base_ref"]:
         return fail("BASE_REF_DRIFT")
     current_head = current.get("head_sha", "")
     if not isinstance(current_head, str) or not re.fullmatch(
@@ -1317,8 +1332,15 @@ def finalize(
         or not re.fullmatch(r"[0-9a-f]{40}", current_base_sha)
         or not isinstance(current_default_sha, str)
         or not re.fullmatch(r"[0-9a-f]{40}", current_default_sha)
-        or current_base_sha != current_default_sha
-        or current_default_sha != review_input["base_sha"]
+        or current_base_sha != review_input["base_sha"]
+    ):
+        return fail("STALE_BASE")
+    if (
+        current_base_provenance.get("mode") == "default"
+        and (
+            current_base_ref != current_default_branch
+            or current_base_sha != current_default_sha
+        )
     ):
         return fail("STALE_BASE")
 
@@ -1584,6 +1606,7 @@ def command_finalize(args: argparse.Namespace) -> None:
         pathlib.Path(args.coverage),
         pathlib.Path(args.lookup_context),
         pathlib.Path(args.review_input),
+        pathlib.Path(args.base_provenance),
         pathlib.Path(args.current_pr),
         pathlib.Path(args.provenance),
         args.reviewer_revision,
@@ -1674,6 +1697,7 @@ def parser() -> argparse.ArgumentParser:
     final.add_argument("--coverage", required=True)
     final.add_argument("--lookup-context", required=True)
     final.add_argument("--review-input", required=True)
+    final.add_argument("--base-provenance", required=True)
     final.add_argument("--current-pr", required=True)
     final.add_argument("--provenance", required=True)
     final.add_argument("--reviewer-revision", required=True)

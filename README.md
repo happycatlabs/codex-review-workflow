@@ -5,8 +5,10 @@ Reusable exact-snapshot Codex review for `happycatlabs/*` pull requests.
 The V2 workflow has five review-gate jobs followed by three isolated,
 non-gating thread-resolution jobs:
 
-1. verify a base-controlled `pull_request_target` still targets the repository's
-   current default branch and that its live base is an ancestor of the PR head;
+1. verify a base-controlled `pull_request_target` is either an exact current
+   default-branch PR or a proven dependent child in one bounded native GitHub
+   Stack, and that every dependency edge from the active root through the
+   target has commit ancestry;
 2. prepare a bounded, strict UTF-8 `BASE..HEAD` diff plus exact-head source
    context for changed files, unchanged direct callers, and direct relative or
    `@/` dependencies, with no secrets;
@@ -63,6 +65,10 @@ jobs:
 Replace `WORKFLOW_COMMIT_SHA` with the immutable SHA. Keep the caller limited
 to invoking this reusable workflow; a `pull_request_target` caller must never
 check out or execute pull-request code.
+
+The example keeps the existing `branches: [master]` consumer filter. The
+reusable workflow can prove dependent stack children, but those events do not
+reach it until a separately reviewed consumer change broadens that filter.
 
 The workflow loads its trusted helper code from `job.workflow_repository` at
 the exact `job.workflow_sha`. This currently works without a separate checkout
@@ -141,7 +147,9 @@ The publisher uploads the unchanged v3
 `codex-review-result/codex-review-result.json` plus a bounded
 `codex-review-publication/v1` receipt containing the verified Dancer actor,
 review id, request digest, exact observed generation, and idempotent-reuse
-status. After one successful review POST, bounded read-only evidence retries
+status. Direct behavior is unchanged; stack receipts seal the validated active
+root-to-target lineage without binding descendants or draft-only state. After
+one successful review POST, bounded read-only evidence retries
 with at most 31 seconds of backoff allow GitHub's review/comment indexes to
 converge; they never repeat the mutation or relax actor, body, commit,
 coordinate, or `COMMENTED` validation. The review-scoped comment collection is
@@ -162,7 +170,10 @@ GitHub `NOTE` or `CAUTION` callout, `### Production impact`, and `### Evidence`.
 Every structured code location is an immutable exact-head blob link. Finding
 fingerprints remain in the v3 machine result and never appear in public prose.
 Before mutation the publisher revalidates the open PR, head, base ref, base
-SHA, and current default-branch SHA. It also reads back the Dancer-authored
+SHA, current default-branch SHA, and the complete prepared base provenance. A
+stack topology change fails with zero publication mutation; it never becomes
+an unbound stale summary. A failed complete root-to-target ancestry proof also
+has zero publication authority. It also reads back the Dancer-authored
 review and every inline comment. An exact hidden request marker makes response
 recovery and identical reruns idempotent; it does not resolve or alter any old
 thread.
@@ -178,7 +189,8 @@ open, even when the current review has unrelated findings. Resolver failure is
 recorded only in a separate `codex-review-resolution/v1` receipt and cannot
 change the v3 verdict, publication, or review gate.
 
-The resolver proves write authorship from the freshly verified, repository-
+The resolver re-proves the same receipt-bound base provenance immediately
+before any thread mutation. It proves write authorship from the freshly verified, repository-
 scoped Dancer App token immediately before its one-shot mutation. GitHub types
 `PullRequestReviewThread.resolvedBy` as `User`, so that field is informational
 only and is never used or reported as Dancer identity. The exact client

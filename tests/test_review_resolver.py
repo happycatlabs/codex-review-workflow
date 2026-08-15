@@ -142,12 +142,31 @@ class FakeGitHub:
                 }
             }
         if method == "GET" and path == "/repos/happycatlabs/fable":
-            return {"default_branch": "master"}
+            return {
+                "id": 979193317,
+                "full_name": REPOSITORY,
+                "default_branch": "master",
+            }
         if method == "GET" and path == f"/repos/happycatlabs/fable/pulls/{PULL_NUMBER}":
             return {
+                "number": PULL_NUMBER,
                 "state": "open",
-                "head": {"sha": self.head_sha},
-                "base": {"ref": "master", "sha": BASE_SHA},
+                "merged_at": None,
+                "user": {
+                    "login": review_publisher.EXPECTED_DANCER_LOGIN,
+                    "id": review_publisher.EXPECTED_DANCER_ACTOR_ID,
+                },
+                "head": {
+                    "ref": "codex/test-head",
+                    "sha": self.head_sha,
+                    "repo": {"id": 979193317, "full_name": REPOSITORY},
+                },
+                "base": {
+                    "ref": "master",
+                    "sha": BASE_SHA,
+                    "repo": {"id": 979193317, "full_name": REPOSITORY},
+                },
+                "stack": None,
             }
         if method == "GET" and path == "/repos/happycatlabs/fable/commits/master":
             return {"sha": BASE_SHA}

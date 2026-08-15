@@ -763,7 +763,12 @@ def prepare(
     )
     client = GitHubClient(token)
     observed = review_publisher.current_generation(client, repository, pull_number)
-    if not review_publisher.generation_is_current(current_result, observed):
+    expected_base_provenance = review_resolution.publication_base_provenance(
+        current_receipt
+    )
+    if not review_publisher.generation_is_current(
+        current_result, observed, expected_base_provenance
+    ):
         raise ResolutionFailure("RESOLUTION_GENERATION_DRIFT")
     _validate_live_publication(
         client, repository, pull_number, current_result, current_receipt
@@ -1164,7 +1169,12 @@ def apply(
         observed = review_publisher.current_generation(
             read_client, repository, pull_number
         )
-        if not review_publisher.generation_is_current(current_result, observed):
+        expected_base_provenance = review_resolution.publication_base_provenance(
+            current_receipt
+        )
+        if not review_publisher.generation_is_current(
+            current_result, observed, expected_base_provenance
+        ):
             raise ResolutionFailure("RESOLUTION_GENERATION_DRIFT")
         _validate_live_publication(
             read_client, repository, pull_number, current_result, current_receipt

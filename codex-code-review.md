@@ -16,12 +16,25 @@ on:
     types: [opened, reopened, synchronize, ready_for_review, edited]
 ```
 
-The guard refetches repository, pull request, and default-branch state and
-requires an open PR whose `base.ref` is the current default branch and whose
-`base.sha` is the independently resolved current default-branch commit. It
-exports exact pull, head, base, ref, and state identities. Every later job
+The guard refetches repository, pull request, and default-branch state through
+trusted helper code. A direct PR must still have `base.ref` equal to the current
+default branch and `base.sha` equal to its independently resolved tip. A
+dependent child is accepted only when the PR's stack membership and one exact
+`GET /repos/{owner}/{repo}/stacks/{number}` read prove a bounded, acyclic,
+same-repository Dancer lineage rooted at that default tip. Missing, stale,
+closed, forked, ambiguous, cyclic, or reordered topology fails closed. The
+native API may retain a closed, merged prefix after lower layers land; trusted
+canonicalization validates that history but seals only the open active suffix
+through the target. Descendants above the target and draft-state changes are
+not generation identity.
+The guard exports the exact pull generation and base64-transports one canonical
+`codex-review-base-provenance/v1` object to preparation. Every later job
 depends on this guard. The caller must contain only the reusable invocation; it
 must never check out or execute PR code.
+
+The current consumer example still filters `branches: [master]`; enabling
+child events is a separate caller change after this reusable workflow ships
+and is proven.
 
 ### 2. Prepare exact-head data
 
@@ -29,8 +42,10 @@ Preparation has no secrets. It checks out the guarded head with persisted
 credentials disabled and treats every repository blob as data. It runs no
 repository program, hook, package manager, build, or script.
 
-Before assembly, `git merge-base --is-ancestor BASE_SHA HEAD_SHA` must succeed.
-A behind-base head returns `BASE_NOT_ANCESTOR`, not a misleading reverse diff.
+Before assembly, trusted code runs `git merge-base --is-ancestor` for every
+dependency edge from the active default-rooted layer through the target. A
+non-ancestor anywhere in that chain returns `BASE_NOT_ANCESTOR`, has zero
+publication authority, and cannot produce a misleading reverse diff.
 
 Trusted code reads immutable `HEAD` blobs with `git ls-tree` and `git cat-file`.
 It scans only a fixed source-extension set, excludes symlinks, generated/build
@@ -52,8 +67,12 @@ identity contract: callers that compare `coverage.diff_sha256` must hash the
 same exact `BASE..HEAD` output and use compatible Git diff behavior for that
 recipe. A Git upgrade that changes function-context hunk selection must be
 validated across producer and consumer before rollout. Binary numstat entries
-and invalid UTF-8 fail preparation. Default-branch guidance is read by exact
-base SHA and separately delimited as trusted.
+and invalid UTF-8 fail preparation. Default-branch guidance is always read by
+the independently resolved protected default SHA, never from a feature base
+branch, and is separately delimited as trusted. The reviewed diff remains the
+exact guarded `BASE_SHA..HEAD_SHA`, so a stack child sees only its layer.
+Preparation seals the canonical base provenance beside `review-input.json`;
+feature-base code is never executed.
 
 ### 3. Resolve exact-ticket intent and seal prompt
 
@@ -104,9 +123,10 @@ findings already returned by successful partitions.
 
 ### 5. Trusted publish
 
-Publication has no model or Linear credential. It refetches current PR and
-default-branch state and rejects closure, retargeting, head drift, base drift,
-lookup failure, or invalid identity before accepting model output. The caller's
+Publication has no model or Linear credential. It re-runs the same trusted
+GitHub reads and canonical base-provenance validation, then rejects closure,
+retargeting, head drift, base drift, stack-topology drift, lookup failure, or
+invalid identity before accepting model output. The caller's
 `${{ github.token }}` is read-only in this job and can never author a review.
 
 It reads the Actions run with `actions: read`, requires exactly one immutable
@@ -129,10 +149,13 @@ The publisher reads bounded, paginated review evidence for an exact hidden
 request digest, then re-fetches the PR again immediately before writing and
 submits one review with `event: COMMENT`. When every finding is addressable and
 the count is at most 20, the review contains resolvable inline threads bound to
-the exact head. Invalid or stale coordinates, comment overflow, generation
-drift, and inline API rejection produce one complete summary review with a
-stable fallback reason. Publication is all-inline or all-summary, never
-partial. After a mutation or an ambiguous response, the publisher reads back
+the exact head. Invalid or stale coordinates, comment overflow, direct-default
+generation drift, and inline API rejection produce one complete summary review
+with a stable fallback reason. Stack provenance drift instead produces zero
+publication mutation. A failed complete root-to-target ancestry proof likewise
+produces zero publication mutation. Publication is all-inline or all-summary,
+never partial.
+After a mutation or an ambiguous response, the publisher reads back
 the exact review and its complete inline-comment set and verifies Dancer actor,
 body, commit, locations, and comment bodies. An identical request reuses only
 that fully verified review; it never mutates or resolves an older thread.
@@ -143,9 +166,10 @@ production impact, then evidence. Structured code locations are immutable
 renderer flattens model-controlled prose, escapes HTML controls, and redacts
 every exact machine fingerprint before publication. A
 publication failure invalidates a clean result. The job then uploads the
-unchanged v3 result plus a separate `codex-review-publication/v1` receipt and
-fails unless both `verdict == "clean"` and publication succeeded. Reviews,
-comments, and summaries are not approval or merge authority.
+unchanged v3 result plus a separate `codex-review-publication/v1` receipt. Its
+`observed_generation` includes the canonical base provenance used at the final
+write boundary. The job fails unless both `verdict == "clean"` and publication
+succeeded. Reviews, comments, and summaries are not approval or merge authority.
 
 ### 6. Read-only resolution preparation
 
@@ -175,9 +199,10 @@ other, unrelated findings.
 The apply job has no OpenAI credential or pull-request checkout. It receives
 trusted helpers through the immutable preparation artifact and mints a separate
 repository-scoped Dancer token only when a resolve decision exists. Before any
-mutation it revalidates the open PR, exact head/base/default branch, unchanged
-current publication receipt and review, every single-root thread, exact REST
-comment, and retained prior provenance. It then sends one fixed
+mutation it revalidates the open PR, exact head/base/default branch, exact
+receipt-bound stack topology, unchanged current publication receipt and review,
+every single-root thread, exact REST comment, and retained prior provenance. It
+then sends one fixed
 `resolveReviewThread(threadId)` mutation per resolve decision, never retries a
 mutation blindly, requires the exact client mutation id and resolved thread in
 the response, and reads the exact resolved thread back before rechecking the
@@ -302,7 +327,7 @@ Preparation and lookup failures are explicit and can never become clean:
 
 | Codes | Meaning |
 |---|---|
-| `PREPARE_FAILED`, `BASE_NOT_ANCESTOR` | Exact generation data could not be prepared. |
+| `PREPARE_FAILED`, `BASE_NOT_ANCESTOR`, `BASE_PROVENANCE_INVALID` | Exact generation data or base provenance could not be prepared. |
 | `SOURCE_CONTEXT_FAILED`, `SOURCE_CONTEXT_TIMEOUT` | Trusted source lookup failed or timed out. |
 | `SOURCE_CONTEXT_STALE`, `SOURCE_CONTEXT_TRUNCATED` | Source binding or bounds are incomplete. |
 | `TICKET_CONTEXT_AUTH_MISSING`, `TICKET_CONTEXT_GRAPHQL_ERROR` | Protected read path is unavailable. |
@@ -311,7 +336,7 @@ Preparation and lookup failures are explicit and can never become clean:
 | `TICKET_CONTEXT_STALE`, `TICKET_CONTEXT_TEAM_MISMATCH`, `TICKET_CONTEXT_TRUNCATED` | Intent is stale, outside the protected team, or incomplete. |
 | `UNTRUSTED_MARKER_COLLISION`, `INPUT_TRUNCATED`, `COVERAGE_INVALID` | Prompt boundaries or bounded coverage are unsafe. |
 | `MODEL_OUTPUT_MISSING`, `MODEL_OUTPUT_MALFORMED`, `MODEL_OUTPUT_INVALID`, `REVIEW_FAILED` | Review execution did not yield valid output. |
-| `PR_STATE_LOOKUP_FAILED`, `PR_STATE_INVALID`, `BASE_BRANCH_INVALID`, `BASE_REF_DRIFT`, `STALE_HEAD`, `STALE_BASE` | Current exact generation no longer matches. |
+| `PR_STATE_LOOKUP_FAILED`, `PR_STATE_INVALID`, `BASE_BRANCH_INVALID`, `BASE_REF_DRIFT`, `BASE_PROVENANCE_DRIFT`, `STALE_HEAD`, `STALE_BASE` | Current exact generation or stack topology no longer matches. |
 | `WORKFLOW_PROVENANCE_MISSING` | Immutable reusable-workflow provenance is absent. |
 | `STALE_BEFORE_PUBLICATION`, `PUBLICATION_FAILED` | The final write-time generation check drifted or the review could not be published. |
 
@@ -352,13 +377,19 @@ disposable PRs that prove:
 2. an `@/`-aliased unchanged caller/dependency regression missed by diff-only
    review is found;
 3. clean, finding, missing/malformed context, wrong team, provider failure,
-   head drift, and base drift remain exact-generation bound;
+   head drift, base drift, and stack-topology drift remain exact-generation
+   bound;
 4. a clean summary and a valid changed-line inline finding are both authored by
    verified Dancer, while invalid location, overflow, stale generation, and
    GitHub `422` create complete Dancer-authored summary reviews;
 5. command-shaped source, ticket, and resolution data cannot execute or obtain
    credentials;
-6. a prior fixed finding resolves only with exact retained provenance, while a
+6. two- and three-layer Dancer stacks review only the exact child layer, while
+   descendants and draft changes do not perturb target identity, and missing,
+   forked, closed, stale, ambiguous, cyclic, chain-wide non-ancestor, and
+   changed topology all fail closed without feature-base execution or
+   publication;
+7. a prior fixed finding resolves only with exact retained provenance, while a
    human reply, legacy comment, missing artifact, current matching fingerprint,
    ambiguity, and candidate overflow all produce zero mutation; outdated state
    alone never supplies the addressed-or-superseded proof.

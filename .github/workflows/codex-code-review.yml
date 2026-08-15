@@ -1,7 +1,7 @@
 name: Codex Code Review (reusable)
 
 # Trust flow:
-# 1. guard verifies a base-controlled pull_request_target for the default branch;
+# 1. guard verifies a base-controlled pull_request_target and exact base provenance;
 # 2. prepare performs bounded exact-head source reads through trusted code;
 # 3. intent resolves one owner-bound ticket with protected read credentials;
 # 4. review receives only a generated prompt and no tools or credentials;
@@ -63,7 +63,7 @@ concurrency:
 
 jobs:
   trust-guard:
-    name: Require current default-branch pull request
+    name: Require trusted current pull request base
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions:
@@ -76,11 +76,21 @@ jobs:
       base_sha: ${{ steps.resolve.outputs.base_sha }}
       head_sha: ${{ steps.resolve.outputs.head_sha }}
       state: ${{ steps.resolve.outputs.state }}
+      base_provenance_b64: ${{ steps.resolve.outputs.base_provenance_b64 }}
     steps:
+      - name: Checkout exact reusable-workflow source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: trusted-workflow
+          persist-credentials: false
+          sparse-checkout: src
+
       - name: Resolve current trusted pull request state
         id: resolve
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -97,21 +107,18 @@ jobs:
             exit 1
           fi
 
-          repo_json=$(mktemp)
-          pr_json=$(mktemp)
-          gh api "repos/${REPOSITORY}" > "${repo_json}"
-          gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" > "${pr_json}"
+          generation_json=$(mktemp)
+          python3 trusted-workflow/src/review_publisher.py prove-generation \
+            --repository "${REPOSITORY}" \
+            --pull-number "${PR_NUMBER}" \
+            --output "${generation_json}"
 
-          default_branch=$(jq -er '.default_branch' "${repo_json}")
-          encoded_default_branch=$(jq -rn --arg value "${default_branch}" '$value | @uri')
-          default_commit_json=$(mktemp)
-          gh api "repos/${REPOSITORY}/commits/${encoded_default_branch}" \
-            > "${default_commit_json}"
-          default_branch_sha=$(jq -er '.sha' "${default_commit_json}")
-          state=$(jq -er '.state' "${pr_json}")
-          base_ref=$(jq -er '.base.ref' "${pr_json}")
-          base_sha=$(jq -er '.base.sha' "${pr_json}")
-          head_sha=$(jq -er '.head.sha' "${pr_json}")
+          default_branch=$(jq -er '.default_branch' "${generation_json}")
+          default_branch_sha=$(jq -er '.default_branch_sha' "${generation_json}")
+          state=$(jq -er '.state' "${generation_json}")
+          base_ref=$(jq -er '.base_ref' "${generation_json}")
+          base_sha=$(jq -er '.base_sha' "${generation_json}")
+          head_sha=$(jq -er '.head_sha' "${generation_json}")
 
           if [ -n "${EVENT_DEFAULT_BRANCH}" ] \
               && [ "${EVENT_DEFAULT_BRANCH}" != "${default_branch}" ]; then
@@ -126,20 +133,14 @@ jobs:
             echo "Pull request is not open." >&2
             exit 1
           fi
-          if [ "${base_ref}" != "${default_branch}" ]; then
-            echo "Pull request does not target the current default branch." >&2
-            exit 1
-          fi
           if ! [[ "${base_sha}" =~ ^[0-9a-f]{40}$ ]] \
               || ! [[ "${head_sha}" =~ ^[0-9a-f]{40}$ ]] \
               || ! [[ "${default_branch_sha}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Pull request commit identity is invalid." >&2
             exit 1
           fi
-          if [ "${base_sha}" != "${default_branch_sha}" ]; then
-            echo "Pull request base is not the current default-branch commit." >&2
-            exit 1
-          fi
+          base_provenance_b64=$(jq -c '.base_provenance' "${generation_json}" \
+            | base64 | tr -d '\n')
 
           {
             echo "default_branch=${default_branch}"
@@ -148,6 +149,7 @@ jobs:
             echo "base_sha=${base_sha}"
             echo "head_sha=${head_sha}"
             echo "state=${state}"
+            echo "base_provenance_b64=${base_provenance_b64}"
           } >> "${GITHUB_OUTPUT}"
 
   prepare:
@@ -163,6 +165,7 @@ jobs:
       BASE_REF: ${{ needs.trust-guard.outputs.base_ref }}
       BASE_SHA: ${{ needs.trust-guard.outputs.base_sha }}
       DEFAULT_BRANCH_SHA: ${{ needs.trust-guard.outputs.default_branch_sha }}
+      BASE_PROVENANCE_B64: ${{ needs.trust-guard.outputs.base_provenance_b64 }}
       REVIEW_STATE: ${{ needs.trust-guard.outputs.state }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       CHECKOUT_DIR: repo-checkout
@@ -190,13 +193,36 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Require reviewed base to be an ancestor of head
+      - name: Seal trusted base provenance
         run: |
           set -euo pipefail
-          python3 "trusted-workflow/src/review_contract.py" check-ancestry \
+          python3 <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import shutil
+
+          metadata = pathlib.Path(os.environ["METADATA_DIR"]).resolve()
+          if metadata.exists():
+              shutil.rmtree(metadata)
+          metadata.mkdir(parents=True)
+          provenance = json.loads(
+              base64.b64decode(
+                  os.environ["BASE_PROVENANCE_B64"], validate=True
+              ).decode("utf-8", errors="strict")
+          )
+          metadata.joinpath("base-provenance.json").write_text(
+              json.dumps(provenance, indent=2) + "\n"
+          )
+          PY
+
+      - name: Require complete root-to-target ancestry
+        run: |
+          set -euo pipefail
+          python3 "trusted-workflow/src/base_provenance.py" check-ancestry \
             --repository "${CHECKOUT_DIR}" \
-            --base-sha "${BASE_SHA}" \
-            --head-sha "${HEAD_SHA}" \
+            --provenance "${METADATA_DIR}/base-provenance.json" \
             --error-output "${REVIEW_BUNDLE}/review-execution.json"
 
       - name: Build trusted guidance and untrusted diff data
@@ -213,16 +239,15 @@ jobs:
           staging = pathlib.Path(os.environ["STAGING_DIR"]).resolve()
           trusted = pathlib.Path(os.environ["TRUSTED_CONTEXT"]).resolve()
           metadata = pathlib.Path(os.environ["METADATA_DIR"]).resolve()
-          for directory in (staging, trusted, metadata):
+          for directory in (staging, trusted):
               if directory.exists():
                   shutil.rmtree(directory)
               directory.mkdir(parents=True)
+          metadata.mkdir(parents=True, exist_ok=True)
 
           head_sha = os.environ["HEAD_SHA"]
           base_sha = os.environ["BASE_SHA"]
           default_sha = os.environ["DEFAULT_BRANCH_SHA"]
-          if base_sha != default_sha:
-              raise ValueError("review base is not the resolved default-branch SHA")
           actual_head = subprocess.run(
               ["git", "-C", str(checkout), "rev-parse", "HEAD"],
               check=True,
@@ -247,7 +272,6 @@ jobs:
           metadata.joinpath("review-input.json").write_text(
               json.dumps(review_input, indent=2) + "\n"
           )
-
           changed_output = subprocess.run(
               [
                   "git", "-C", str(checkout), "diff", "--name-only", "-z",
@@ -610,6 +634,7 @@ jobs:
       EXPECTED_BASE_REF: ${{ needs.trust-guard.outputs.base_ref }}
       EXPECTED_BASE_SHA: ${{ needs.trust-guard.outputs.base_sha }}
       EXPECTED_STATE: ${{ needs.trust-guard.outputs.state }}
+      EXPECTED_BASE_PROVENANCE_B64: ${{ needs.trust-guard.outputs.base_provenance_b64 }}
       RESULT_ARTIFACT: codex-review-result
 
     steps:
@@ -650,6 +675,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p codex-review-input/metadata codex-review-input/model-workspace codex-review-result
+          if [ ! -s codex-review-input/metadata/base-provenance.json ]; then
+            printf '%s' "${EXPECTED_BASE_PROVENANCE_B64}" | base64 --decode \
+              > codex-review-input/metadata/base-provenance.json
+            printf '\n' >> codex-review-input/metadata/base-provenance.json
+          fi
           if [ ! -s codex-review-input/metadata/review-input.json ]; then
             jq -n \
               --argjson pull_number "${PR_NUMBER}" \
@@ -715,37 +745,20 @@ jobs:
               --execution-output codex-review-input/review-execution.json
           fi
 
-      - name: Refetch current pull request and default branch
+      - name: Re-prove current pull request base provenance
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          repo_json=$(mktemp)
-          pr_json=$(mktemp)
-          if ! gh api "repos/${REPOSITORY}" > "${repo_json}" \
-              || ! gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" > "${pr_json}"; then
+          generation_json=$(mktemp)
+          if ! python3 trusted-workflow/src/review_publisher.py prove-generation \
+              --repository "${REPOSITORY}" \
+              --pull-number "${PR_NUMBER}" \
+              --output "${generation_json}"; then
             printf '{"lookup_success":false}\n' > codex-review-result/current-pr.json
             exit 0
           fi
-          default_branch=$(jq -r '.default_branch // ""' "${repo_json}")
-          encoded_default_branch=$(jq -rn --arg value "${default_branch}" '$value | @uri')
-          default_commit_json=$(mktemp)
-          if [ -z "${default_branch}" ] \
-              || ! gh api "repos/${REPOSITORY}/commits/${encoded_default_branch}" \
-                > "${default_commit_json}"; then
-            printf '{"lookup_success":false}\n' > codex-review-result/current-pr.json
-            exit 0
-          fi
-          jq -n \
-            --arg state "$(jq -r '.state // ""' "${pr_json}")" \
-            --arg head_sha "$(jq -r '.head.sha // ""' "${pr_json}")" \
-            --arg base_ref "$(jq -r '.base.ref // ""' "${pr_json}")" \
-            --arg base_sha "$(jq -r '.base.sha // ""' "${pr_json}")" \
-            --arg default_branch "${default_branch}" \
-            --arg default_branch_sha "$(jq -r '.sha // ""' "${default_commit_json}")" \
-            '{lookup_success:true,state:$state,head_sha:$head_sha,base_ref:$base_ref,
-              base_sha:$base_sha,default_branch:$default_branch,
-              default_branch_sha:$default_branch_sha}' \
+          jq '. + {lookup_success:true}' "${generation_json}" \
             > codex-review-result/current-pr.json
 
       - name: Resolve immutable reusable workflow provenance
@@ -895,6 +908,7 @@ jobs:
             --coverage codex-review-input/metadata/coverage.json \
             --lookup-context codex-review-input/metadata/lookup-context.json \
             --review-input codex-review-input/metadata/review-input.json \
+            --base-provenance codex-review-input/metadata/base-provenance.json \
             --current-pr codex-review-result/current-pr.json \
             --provenance codex-review-result/workflow-provenance.json \
             --reviewer-revision "${REVIEWER_REVISION}" \
@@ -960,6 +974,7 @@ jobs:
               --summary-request "${summary_request}" \
               --repository "${REPOSITORY}" \
               --run-id "${GITHUB_RUN_ID}" \
+              --base-provenance codex-review-input/metadata/base-provenance.json \
               --receipt-output codex-review-result/publication-receipt.json
           else
             jq \
@@ -1082,6 +1097,7 @@ jobs:
           cp trusted-workflow/src/review_resolver.py "${RESOLUTION_INPUT}/trusted/"
           cp trusted-workflow/src/review_publication.py "${RESOLUTION_INPUT}/trusted/"
           cp trusted-workflow/src/review_publisher.py "${RESOLUTION_INPUT}/trusted/"
+          cp trusted-workflow/src/base_provenance.py "${RESOLUTION_INPUT}/trusted/"
           cp trusted-workflow/src/review_contract.py "${RESOLUTION_INPUT}/trusted/"
           cp trusted-workflow/src/intent_context.py "${RESOLUTION_INPUT}/trusted/"
           cp trusted-workflow/src/source_context.py "${RESOLUTION_INPUT}/trusted/"

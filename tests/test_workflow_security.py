@@ -20,6 +20,7 @@ PUBLICATION = ROOT / "src/review_publication.py"
 PUBLISHER = ROOT / "src/review_publisher.py"
 RESOLUTION = ROOT / "src/review_resolution.py"
 RESOLVER = ROOT / "src/review_resolver.py"
+BASE_PROVENANCE = ROOT / "src/base_provenance.py"
 CODEX_ACTION_SHA = "52fe01ec70a42f454c9d2ebd47598f9fd6893d56"
 APP_TOKEN_ACTION_SHA = "bcd2ba49218906704ab6c1aa796996da409d3eb1"
 EXPECTED_WORKFLOW_PATH = (
@@ -55,15 +56,19 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertNotIn("inputs.runner", self.workflow)
         self.assertNotIn("SENTRY", self.workflow.upper())
 
-    def test_default_branch_guard_precedes_all_sensitive_jobs(self):
+    def test_base_provenance_guard_precedes_all_sensitive_jobs(self):
         guard = self.job("trust-guard", "prepare")
         for text in (
             'if [ "${EVENT_NAME}" != pull_request_target ]',
-            'gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}"',
-            'if [ "${base_ref}" != "${default_branch}" ]',
-            'if [ "${base_sha}" != "${default_branch_sha}" ]',
+            "review_publisher.py prove-generation",
+            '--repository "${REPOSITORY}"',
+            '--pull-number "${PR_NUMBER}"',
+            "base_provenance_b64",
         ):
             self.assertIn(text, guard)
+        self.assertNotIn(
+            'if [ "${base_ref}" != "${default_branch}" ]', guard
+        )
         self.assertNotIn("secrets.", guard)
         self.assertIn("needs: [trust-guard, prepare]", self.job("intent", "review"))
         self.assertIn(
@@ -75,6 +80,7 @@ class WorkflowSecurityTests(unittest.TestCase):
 
     def test_trusted_helper_is_checked_out_at_exact_workflow_identity(self):
         for name, next_name in (
+            ("trust-guard", "prepare"),
             ("prepare", "intent"),
             ("intent", "review"),
             ("publish", "resolution-prepare"),
@@ -85,11 +91,10 @@ class WorkflowSecurityTests(unittest.TestCase):
             self.assertIn("ref: ${{ job.workflow_sha }}", block)
             self.assertIn("persist-credentials: false", block)
             self.assertIn("sparse-checkout: src", block)
-            expected_helper = (
-                "trusted-workflow/src/review_resolution.py"
-                if name == "resolution-prepare"
-                else "trusted-workflow/src/review_contract.py"
-            )
+            expected_helper = {
+                "trust-guard": "trusted-workflow/src/review_publisher.py",
+                "resolution-prepare": "trusted-workflow/src/review_resolution.py",
+            }.get(name, "trusted-workflow/src/review_contract.py")
             self.assertIn(expected_helper, block)
         self.assertNotIn("# BEGIN REVIEW_CONTRACT", self.workflow)
         self.assertNotIn("contract/review_contract.py", self.workflow)
@@ -112,6 +117,50 @@ class WorkflowSecurityTests(unittest.TestCase):
         )
         self.assertIn("secrets.OPENAI_API_KEY", review)
         self.assertNotIn("OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}", review)
+
+    def test_stacked_base_is_never_checked_out_or_executed(self):
+        prepare = self.job("prepare", "intent")
+        guard = self.job("trust-guard", "prepare")
+        self.assertIn("Checkout exact pull request head as data", prepare)
+        self.assertIn("ref: ${{ needs.trust-guard.outputs.head_sha }}", prepare)
+        self.assertNotIn("ref: ${{ needs.trust-guard.outputs.base_ref }}", prepare)
+        self.assertNotIn("ref: ${{ needs.trust-guard.outputs.base_sha }}", prepare)
+        self.assertNotIn("actions/checkout", prepare.split(
+            "      - name: Checkout exact pull request head as data\n", 1
+        )[1].split("      - name: Seal trusted base provenance", 1)[0].replace(
+            "uses: actions/checkout", ""
+        ))
+        self.assertNotIn("run:", guard.split(
+            "      - name: Checkout exact reusable-workflow source\n", 1
+        )[1].split("      - name: Resolve current trusted pull request state", 1)[0])
+        self.assertIn(
+            '["git", "-C", str(checkout), "show", f"{default_sha}:{rel_path}"]',
+            prepare,
+        )
+
+    def test_complete_ancestry_uses_sealed_provenance_before_model_input(self):
+        prepare = self.job("prepare", "intent")
+        sealed = "      - name: Seal trusted base provenance\n"
+        ancestry = "      - name: Require complete root-to-target ancestry\n"
+        build = "      - name: Build trusted guidance and untrusted diff data\n"
+
+        self.assertLess(prepare.index(sealed), prepare.index(ancestry))
+        self.assertLess(prepare.index(ancestry), prepare.index(build))
+        ancestry_step = prepare.split(ancestry, 1)[1].split(build, 1)[0]
+        self.assertIn(
+            'python3 "trusted-workflow/src/base_provenance.py" check-ancestry',
+            ancestry_step,
+        )
+        self.assertIn(
+            '--provenance "${METADATA_DIR}/base-provenance.json"',
+            ancestry_step,
+        )
+        self.assertNotIn("review_contract.py", ancestry_step)
+        self.assertNotIn("--base-sha", ancestry_step)
+        self.assertNotIn("--head-sha", ancestry_step)
+        self.assertEqual(prepare.count("base64.b64decode"), 1)
+        self.assertIn("for directory in (staging, trusted):", prepare)
+        self.assertNotIn("for directory in (staging, trusted, metadata):", prepare)
 
     def test_ticket_lookup_is_exact_and_not_prompt_controlled(self):
         intent_job = self.job("intent", "review")
@@ -200,7 +249,8 @@ class WorkflowSecurityTests(unittest.TestCase):
     def test_publisher_refetches_identity_and_proves_workflow_revision(self):
         publish = self.job("publish", "resolution-prepare")
         for text in (
-            'gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}"',
+            "review_publisher.py prove-generation",
+            "base-provenance.json",
             'actions/runs/${GITHUB_RUN_ID}',
             'run.get("referenced_workflows", [])',
             EXPECTED_WORKFLOW_PATH,
@@ -261,6 +311,8 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("PUBLICATION_READBACK_FAILED", publisher)
         self.assertIn("current_generation(client, repository, pull_number) != observed", publisher)
         self.assertIn("publication-receipt.json", self.workflow)
+        self.assertIn("base_provenance.validate_base_provenance", PUBLISHER.read_text())
+        self.assertIn('"base_provenance": proven_base', PUBLISHER.read_text())
 
     def test_missing_publication_helper_fails_without_posting_partial_summary(self):
         publish = self.job("publish", "resolution-prepare")
@@ -343,6 +395,7 @@ class WorkflowSecurityTests(unittest.TestCase):
             CONTRACT,
             INTENT,
             SOURCE,
+            BASE_PROVENANCE,
         )
         for source in trusted_sources:
             self.assertIn(
