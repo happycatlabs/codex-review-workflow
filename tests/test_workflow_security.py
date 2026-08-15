@@ -309,7 +309,9 @@ class WorkflowSecurityTests(unittest.TestCase):
             resolver,
         )
         self.assertIn("resolvedBy", resolver)
+        self.assertNotIn("... on Bot", resolver)
         self.assertIn("GRAPHQL_DANCER_LOGIN", resolver)
+        self.assertIn("require_dancer_actor", resolver)
         self.assertIn("workflow_sha=args.workflow_sha", resolver)
         apply_step = apply.split(
             "      - name: Revalidate and apply fixed thread mutations\n", 1

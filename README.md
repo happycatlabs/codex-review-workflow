@@ -178,6 +178,13 @@ open, even when the current review has unrelated findings. Resolver failure is
 recorded only in a separate `codex-review-resolution/v1` receipt and cannot
 change the v3 verdict, publication, or review gate.
 
+The resolver proves write authorship from the freshly verified, repository-
+scoped Dancer App token immediately before its one-shot mutation. GitHub types
+`PullRequestReviewThread.resolvedBy` as `User`, so that field is informational
+only and is never used or reported as Dancer identity. The exact client
+mutation id, resolved thread id/state readback, and generation rechecks prove
+the mutation outcome.
+
 See
 [`codex-code-review.md`](codex-code-review.md) for the schema, trust boundaries,
 coverage rules, error codes, canaries, and downstream consumption contract.
