@@ -14,6 +14,7 @@ import review_publication  # noqa: E402
 import review_publisher  # noqa: E402
 import review_resolution  # noqa: E402
 import review_contract  # noqa: E402
+import base_provenance  # noqa: E402
 
 
 REPOSITORY = "happycatlabs/fable"
@@ -141,6 +142,77 @@ def publication_pair(
     return result, receipt, request
 
 
+def stacked_base_provenance(*, draft: bool) -> dict:
+    default_sha = "9" * 40
+    parent_ref = "codex/parent"
+    actor = {
+        "login": review_publisher.EXPECTED_DANCER_LOGIN,
+        "actor_id": review_publisher.EXPECTED_DANCER_ACTOR_ID,
+    }
+
+    def node(
+        *,
+        number: int,
+        base_ref: str,
+        base_sha: str,
+        head_ref: str,
+        head_sha: str,
+    ) -> dict:
+        return {
+            "number": number,
+            "state": "open",
+            "merged_at": None,
+            "draft": draft,
+            "author": actor,
+            "base_ref": base_ref,
+            "base_sha": base_sha,
+            "base_repository_id": 979193317,
+            "head_ref": head_ref,
+            "head_sha": head_sha,
+            "head_repository_id": 979193317,
+        }
+
+    return base_provenance.validate_base_provenance(
+        {
+            "repository": {
+                "id": 979193317,
+                "name_with_owner": REPOSITORY,
+                "default_ref": "master",
+                "default_sha": default_sha,
+            },
+            "target": {
+                "number": PULL_NUMBER,
+                "base_ref": parent_ref,
+                "base_sha": BASE_SHA,
+                "head_ref": "codex/child",
+                "head_sha": HEAD_SHA,
+            },
+            "stack": {
+                "number": 269,
+                "open": True,
+                "base_ref": "master",
+                "expected_actor": actor,
+                "pull_requests": [
+                    node(
+                        number=PULL_NUMBER - 1,
+                        base_ref="master",
+                        base_sha=default_sha,
+                        head_ref=parent_ref,
+                        head_sha=BASE_SHA,
+                    ),
+                    node(
+                        number=PULL_NUMBER,
+                        base_ref=parent_ref,
+                        base_sha=BASE_SHA,
+                        head_ref="codex/child",
+                        head_sha=HEAD_SHA,
+                    ),
+                ],
+            },
+        }
+    )
+
+
 def candidate(fingerprint: str = "d" * 64, thread_id: str = "THREAD_1") -> dict:
     prior_finding = finding(fingerprint)
     return {
@@ -159,6 +231,43 @@ def candidate(fingerprint: str = "d" * 64, thread_id: str = "THREAD_1") -> dict:
 
 
 class ResolutionContractTests(unittest.TestCase):
+    def test_stacked_receipt_reconstructs_draft_free_canonical_provenance(self):
+        result, receipt, _ = publication_pair()
+        prepared = stacked_base_provenance(draft=False)
+        self.assertEqual(prepared, stacked_base_provenance(draft=True))
+        self.assertTrue(
+            all("draft" not in node for node in prepared["stack"]["nodes"])
+        )
+
+        result["base_ref"] = "codex/parent"
+        receipt["expected_generation"] = {
+            "head_sha": HEAD_SHA,
+            "base_ref": "codex/parent",
+            "base_sha": BASE_SHA,
+        }
+        receipt["observed_generation"] = {
+            "state": "open",
+            "head_sha": HEAD_SHA,
+            "base_ref": "codex/parent",
+            "base_sha": BASE_SHA,
+            "default_branch": "master",
+            "default_branch_sha": "9" * 40,
+            "base_provenance": prepared,
+        }
+
+        validated_result, validated_receipt = (
+            review_resolution.validate_publication_pair(
+                result,
+                receipt,
+                repository=REPOSITORY,
+                pull_number=PULL_NUMBER,
+                require_inline=False,
+            )
+        )
+
+        self.assertIs(validated_result, result)
+        self.assertIs(validated_receipt, receipt)
+
     def test_inline_provenance_reconstructs_exact_request_digest(self):
         result, receipt, request = publication_pair([finding()])
 

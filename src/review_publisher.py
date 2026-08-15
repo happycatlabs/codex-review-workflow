@@ -14,6 +14,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import base_provenance
 import review_publication
 
 
@@ -197,6 +198,83 @@ def require_dancer_actor(client: GitHubClient) -> dict[str, Any]:
     return {"login": EXPECTED_DANCER_LOGIN, "id": EXPECTED_DANCER_ACTOR_ID}
 
 
+def _pull_provenance_node(pull: Any) -> dict[str, Any]:
+    if not isinstance(pull, dict):
+        return {}
+    user = pull.get("user")
+    head = pull.get("head")
+    base = pull.get("base")
+    head_repository = head.get("repo") if isinstance(head, dict) else None
+    base_repository = base.get("repo") if isinstance(base, dict) else None
+    return {
+        "number": pull.get("number"),
+        "state": pull.get("state"),
+        "merged_at": pull.get("merged_at"),
+        "draft": pull.get("draft"),
+        "author": {
+            "login": user.get("login") if isinstance(user, dict) else None,
+            "actor_id": user.get("id") if isinstance(user, dict) else None,
+        },
+        "head_ref": head.get("ref") if isinstance(head, dict) else None,
+        "head_sha": head.get("sha") if isinstance(head, dict) else None,
+        "head_repository_id": (
+            head_repository.get("id")
+            if isinstance(head_repository, dict)
+            else None
+        ),
+        "base_ref": base.get("ref") if isinstance(base, dict) else None,
+        "base_sha": base.get("sha") if isinstance(base, dict) else None,
+        "base_repository_id": (
+            base_repository.get("id")
+            if isinstance(base_repository, dict)
+            else None
+        ),
+    }
+
+
+def _base_provenance_payload(
+    repository_data: dict[str, Any],
+    default_branch_sha: Any,
+    pull: dict[str, Any],
+    stack: dict[str, Any] | None,
+) -> dict[str, Any]:
+    target = _pull_provenance_node(pull)
+    stack_payload = None
+    if stack is not None:
+        stack_base = stack.get("base")
+        stack_payload = {
+            "number": stack.get("number"),
+            "open": stack.get("open"),
+            "base_ref": (
+                stack_base.get("ref") if isinstance(stack_base, dict) else None
+            ),
+            "expected_actor": {
+                "login": EXPECTED_DANCER_LOGIN,
+                "actor_id": EXPECTED_DANCER_ACTOR_ID,
+            },
+            "pull_requests": [
+                _pull_provenance_node(item)
+                for item in stack.get("pull_requests", [])
+            ],
+        }
+    return {
+        "repository": {
+            "id": repository_data.get("id"),
+            "name_with_owner": repository_data.get("full_name"),
+            "default_ref": repository_data.get("default_branch"),
+            "default_sha": default_branch_sha,
+        },
+        "target": {
+            "number": target.get("number"),
+            "base_ref": target.get("base_ref"),
+            "base_sha": target.get("base_sha"),
+            "head_ref": target.get("head_ref"),
+            "head_sha": target.get("head_sha"),
+        },
+        "stack": stack_payload,
+    }
+
+
 def current_generation(
     client: GitHubClient, repository: str, pull_number: int
 ) -> dict[str, Any]:
@@ -213,42 +291,66 @@ def current_generation(
     if not isinstance(commit, dict):
         raise PublicationFailure("PUBLICATION_STATE_LOOKUP_FAILED")
     base = pull.get("base")
-    head = pull.get("head")
-    observed = {
-        "state": pull.get("state"),
-        "head_sha": head.get("sha") if isinstance(head, dict) else None,
-        "base_ref": base.get("ref") if isinstance(base, dict) else None,
-        "base_sha": base.get("sha") if isinstance(base, dict) else None,
-        "default_branch": default_branch,
-        "default_branch_sha": commit.get("sha"),
-    }
-    if (
-        observed["state"] not in {"open", "closed"}
-        or not all(
-            isinstance(observed[key], str)
-            for key in (
-                "head_sha",
-                "base_ref",
-                "base_sha",
-                "default_branch_sha",
+    stack = None
+    base_ref = base.get("ref") if isinstance(base, dict) else None
+    base_sha = base.get("sha") if isinstance(base, dict) else None
+    default_branch_sha = commit.get("sha")
+    if base_ref != default_branch or base_sha != default_branch_sha:
+        membership = pull.get("stack")
+        stack_number = (
+            membership.get("number") if isinstance(membership, dict) else None
+        )
+        if type(stack_number) is not int or stack_number < 1:
+            raise PublicationFailure("BASE_PROVENANCE_INVALID")
+        stack = client.request(
+            "GET", f"/repos/{owner}/{name}/stacks/{stack_number}"
+        )
+        if not isinstance(stack, dict) or stack.get("number") != stack_number:
+            raise PublicationFailure("BASE_PROVENANCE_INVALID")
+    try:
+        proven_base = base_provenance.validate_base_provenance(
+            _base_provenance_payload(
+                repository_data,
+                default_branch_sha,
+                pull,
+                stack,
             )
         )
-        or SHA_PATTERN.fullmatch(observed["head_sha"]) is None
-        or SHA_PATTERN.fullmatch(observed["base_sha"]) is None
-        or SHA_PATTERN.fullmatch(observed["default_branch_sha"]) is None
-    ):
+    except (TypeError, ValueError) as error:
+        raise PublicationFailure("BASE_PROVENANCE_INVALID") from error
+    if pull.get("state") not in {"open", "closed"}:
         raise PublicationFailure("PUBLICATION_STATE_LOOKUP_FAILED")
+    observed = {
+        "state": pull.get("state"),
+        "head_sha": proven_base["target"]["head_sha"],
+        "base_ref": proven_base["target"]["base_ref"],
+        "base_sha": proven_base["target"]["base_sha"],
+        "default_branch": proven_base["default"]["ref"],
+        "default_branch_sha": proven_base["default"]["sha"],
+        "base_provenance": proven_base,
+    }
     return observed
 
 
-def generation_is_current(result: dict[str, Any], observed: dict[str, Any]) -> bool:
+def generation_is_current(
+    result: dict[str, Any],
+    observed: dict[str, Any],
+    expected_base_provenance: dict[str, Any] | None = None,
+) -> bool:
+    provenance_is_current = (
+        observed.get("base_provenance") == expected_base_provenance
+        if expected_base_provenance is not None
+        else (
+            observed["default_branch"] == result.get("base_ref")
+            and observed["default_branch_sha"] == result.get("base_sha")
+        )
+    )
     return (
         observed["state"] == "open"
         and observed["head_sha"] == result.get("head_sha")
         and observed["base_ref"] == result.get("base_ref")
         and observed["base_sha"] == result.get("base_sha")
-        and observed["default_branch"] == result.get("base_ref")
-        and observed["default_branch_sha"] == result.get("base_sha")
+        and provenance_is_current
     )
 
 
@@ -257,6 +359,7 @@ def observed_state_is_safe_for_stale_summary(observed: dict[str, Any]) -> bool:
         observed["state"] == "open"
         and observed["base_ref"] == observed["default_branch"]
         and observed["base_sha"] == observed["default_branch_sha"]
+        and observed.get("base_provenance", {}).get("mode") == "default"
     )
 
 
@@ -634,6 +737,7 @@ def publish(
     repository: str,
     run_id: int,
     token: str,
+    base_provenance: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     pull_number = result.get("pull_number")
     planned = result.get("publication")
@@ -651,6 +755,7 @@ def publish(
             or pull_number < 1
             or not isinstance(planned, dict)
             or mode not in {"inline", "summary"}
+            or not isinstance(base_provenance, dict)
         ):
             raise PublicationFailure("PUBLICATION_IDENTITY_INVALID")
         validate_review_request(
@@ -665,6 +770,12 @@ def publish(
             allow_comments=False,
             require_comments=False,
         )
+        if (
+            base_provenance.get("mode") == "stacked"
+            and isinstance(result.get("error"), dict)
+            and result["error"].get("code") == "BASE_NOT_ANCESTOR"
+        ):
+            raise PublicationFailure("BASE_NOT_ANCESTOR")
         client = GitHubClient(token)
         try:
             actor = require_dancer_actor(client)
@@ -675,7 +786,9 @@ def publish(
             raise PublicationFailure("COMMENT_HELPER_MISSING")
 
         target_request = request
-        if not generation_is_current(result, observed):
+        if not generation_is_current(result, observed, base_provenance):
+            if base_provenance.get("mode") == "stacked":
+                raise PublicationFailure("STALE_BEFORE_PUBLICATION")
             if not observed_state_is_safe_for_stale_summary(observed):
                 raise PublicationFailure("STALE_BEFORE_PUBLICATION")
             fallback_reason = "STALE_BEFORE_PUBLICATION"
@@ -721,6 +834,8 @@ def publish(
             if error.reason != "STALE_BEFORE_PUBLICATION":
                 raise
             observed = current_generation(client, repository, pull_number)
+            if base_provenance.get("mode") == "stacked":
+                raise
             if not observed_state_is_safe_for_stale_summary(observed):
                 raise
             mode = "summary"
@@ -734,12 +849,15 @@ def publish(
                 ) from error
             observed = current_generation(client, repository, pull_number)
             mode = "summary"
-            if generation_is_current(result, observed):
+            if generation_is_current(result, observed, base_provenance):
                 fallback_reason = "GITHUB_422"
                 target_request = summary_fallback_request(
                     summary_request, fallback_reason, omit_commit=False
                 )
-            elif observed_state_is_safe_for_stale_summary(observed):
+            elif (
+                base_provenance.get("mode") != "stacked"
+                and observed_state_is_safe_for_stale_summary(observed)
+            ):
                 fallback_reason = "STALE_BEFORE_PUBLICATION"
                 target_request = stale_summary_request(result, repository, run_id)
             else:
@@ -801,9 +919,18 @@ def command_publish(args: argparse.Namespace) -> None:
         repository=args.repository,
         run_id=args.run_id,
         token=os.environ.get("DANCER_GITHUB_TOKEN", ""),
+        base_provenance=load_json(pathlib.Path(args.base_provenance)),
     )
     write_json(result_path, result)
     write_json(pathlib.Path(args.receipt_output), publication_receipt)
+
+
+def command_prove_generation(args: argparse.Namespace) -> None:
+    token = os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GH_TOKEN", "")
+    generation = current_generation(
+        GitHubClient(token), args.repository, args.pull_number
+    )
+    write_json(pathlib.Path(args.output), generation)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -815,8 +942,14 @@ def parser() -> argparse.ArgumentParser:
     publish_command.add_argument("--summary-request", required=True)
     publish_command.add_argument("--repository", required=True)
     publish_command.add_argument("--run-id", required=True, type=int)
+    publish_command.add_argument("--base-provenance", required=True)
     publish_command.add_argument("--receipt-output", required=True)
     publish_command.set_defaults(handler=command_publish)
+    prove_command = commands.add_parser("prove-generation")
+    prove_command.add_argument("--repository", required=True)
+    prove_command.add_argument("--pull-number", required=True, type=int)
+    prove_command.add_argument("--output", required=True)
+    prove_command.set_defaults(handler=command_prove_generation)
     return root
 
 

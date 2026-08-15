@@ -20,6 +20,7 @@ RUN_ID = 123456789
 HEAD_SHA = "a" * 40
 BASE_SHA = "b" * 40
 NEXT_HEAD_SHA = "c" * 40
+REPOSITORY_ID = 979193317
 
 
 def finding() -> dict:
@@ -35,15 +36,20 @@ def finding() -> dict:
     }
 
 
-def result_fixture(findings: list[dict] | None = None) -> dict:
+def result_fixture(
+    findings: list[dict] | None = None,
+    *,
+    base_ref: str = "master",
+    base_sha: str = BASE_SHA,
+) -> dict:
     findings = findings or []
     return {
         "schema_version": "codex-review-result/v3",
         "verdict": "blocking_findings" if findings else "clean",
         "pull_number": PULL_NUMBER,
         "head_sha": HEAD_SHA,
-        "base_ref": "master",
-        "base_sha": BASE_SHA,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
         "state": "open",
         "review_scope": "source_context_v1",
         "coverage": {
@@ -70,15 +76,20 @@ def result_fixture(findings: list[dict] | None = None) -> dict:
     }
 
 
-def publication_plan(findings: list[dict] | None = None):
-    result = result_fixture(findings)
+def publication_plan(
+    findings: list[dict] | None = None,
+    *,
+    base_ref: str = "master",
+    base_sha: str = BASE_SHA,
+):
+    result = result_fixture(findings, base_ref=base_ref, base_sha=base_sha)
     comment_map = {
         "schema_version": review_publication.COMMENT_MAP_VERSION,
         "complete": True,
         "pull_number": PULL_NUMBER,
         "head_sha": HEAD_SHA,
-        "base_ref": "master",
-        "base_sha": BASE_SHA,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
         "diff_sha256": "f" * 64,
         "files": {"lib/example.ts": [[40, 45]]},
     }
@@ -133,7 +144,11 @@ class FakeGitHubClient:
                 }
             }
         if method == "GET" and path == "/repos/happycatlabs/fable":
-            return {"default_branch": "master"}
+            return {
+                "id": REPOSITORY_ID,
+                "full_name": REPOSITORY,
+                "default_branch": "master",
+            }
         if method == "GET" and path == "/repos/happycatlabs/fable/pulls/205":
             self.pull_reads += 1
             if (
@@ -142,9 +157,21 @@ class FakeGitHubClient:
             ):
                 self.head_sha = NEXT_HEAD_SHA
             return {
+                "number": PULL_NUMBER,
                 "state": "open",
-                "head": {"sha": self.head_sha},
-                "base": {"ref": "master", "sha": self.base_sha},
+                "merged_at": None,
+                "user": copy.deepcopy(self.actor),
+                "head": {
+                    "ref": "codex/test-head",
+                    "sha": self.head_sha,
+                    "repo": {"id": REPOSITORY_ID, "full_name": REPOSITORY},
+                },
+                "base": {
+                    "ref": "master",
+                    "sha": self.base_sha,
+                    "repo": {"id": REPOSITORY_ID, "full_name": REPOSITORY},
+                },
+                "stack": None,
             }
         if method == "GET" and path == "/repos/happycatlabs/fable/commits/master":
             self.commit_reads += 1
@@ -269,8 +296,149 @@ class FakeGitHubClient:
         raise AssertionError(f"unexpected request: {method} {path}")
 
 
+class FakeStackedGitHubClient(FakeGitHubClient):
+    def __init__(self):
+        super().__init__()
+        self.default_sha = "9" * 40
+        self.parent_ref = "codex/parent"
+        self.stack_number = 269
+        self.parent_draft = False
+        self.target_draft = False
+        self.descendant_head_sha: str | None = None
+        self.descendant_draft = False
+
+    def _raw_node(
+        self,
+        *,
+        number: int,
+        base_ref: str,
+        base_sha: str,
+        head_ref: str,
+        head_sha: str,
+        draft: bool = False,
+    ) -> dict:
+        return {
+            "number": number,
+            "state": "open",
+            "merged_at": None,
+            "draft": draft,
+            "user": copy.deepcopy(self.actor),
+            "base": {
+                "ref": base_ref,
+                "sha": base_sha,
+                "repo": {"id": REPOSITORY_ID, "full_name": REPOSITORY},
+            },
+            "head": {
+                "ref": head_ref,
+                "sha": head_sha,
+                "repo": {"id": REPOSITORY_ID, "full_name": REPOSITORY},
+            },
+        }
+
+    def request(self, method: str, path: str, payload=None):
+        if method == "GET" and path == "/repos/happycatlabs/fable":
+            return {
+                "id": REPOSITORY_ID,
+                "full_name": REPOSITORY,
+                "default_branch": "master",
+            }
+        if method == "GET" and path == "/repos/happycatlabs/fable/commits/master":
+            self.commit_reads += 1
+            return {"sha": self.default_sha}
+        if method == "GET" and path == "/repos/happycatlabs/fable/pulls/205":
+            self.pull_reads += 1
+            return {
+                **self._raw_node(
+                    number=PULL_NUMBER,
+                    base_ref=self.parent_ref,
+                    base_sha=BASE_SHA,
+                    head_ref="codex/child",
+                    head_sha=self.head_sha,
+                    draft=self.target_draft,
+                ),
+                "stack": {
+                    "number": self.stack_number,
+                    "position": 2,
+                    "size": 2,
+                    "base": {"ref": "master", "sha": self.default_sha},
+                },
+            }
+        if (
+            method == "GET"
+            and path
+            == f"/repos/happycatlabs/fable/stacks/{self.stack_number}"
+        ):
+            pull_requests = [
+                self._raw_node(
+                    number=204,
+                    base_ref="master",
+                    base_sha=self.default_sha,
+                    head_ref=self.parent_ref,
+                    head_sha=BASE_SHA,
+                    draft=self.parent_draft,
+                ),
+                self._raw_node(
+                    number=PULL_NUMBER,
+                    base_ref=self.parent_ref,
+                    base_sha=BASE_SHA,
+                    head_ref="codex/child",
+                    head_sha=self.head_sha,
+                    draft=self.target_draft,
+                ),
+            ]
+            if self.descendant_head_sha is not None:
+                pull_requests.append(
+                    self._raw_node(
+                        number=206,
+                        base_ref="codex/child",
+                        base_sha=self.head_sha,
+                        head_ref="codex/descendant",
+                        head_sha=self.descendant_head_sha,
+                        draft=self.descendant_draft,
+                    )
+                )
+            return {
+                "number": self.stack_number,
+                "open": True,
+                "base": {"ref": "master"},
+                "pull_requests": pull_requests,
+            }
+        return super().request(method, path, payload)
+
+
+class FakeRetainedMergedPrefixGitHubClient(FakeStackedGitHubClient):
+    def request(self, method: str, path: str, payload=None):
+        if (
+            method == "GET"
+            and path
+            == f"/repos/happycatlabs/fable/stacks/{self.stack_number}"
+        ):
+            active = super().request(method, path, payload)
+            merged = self._raw_node(
+                number=203,
+                base_ref="master",
+                base_sha="7" * 40,
+                head_ref="codex/merged-lower",
+                head_sha="8" * 40,
+            )
+            merged["state"] = "closed"
+            merged["merged_at"] = "2026-08-15T09:42:02Z"
+            return {**active, "pull_requests": [merged, *active["pull_requests"]]}
+        return super().request(method, path, payload)
+
+
+def prepared_base_provenance(fake: FakeGitHubClient) -> dict:
+    base_provenance = review_publisher.current_generation(
+        fake, REPOSITORY, PULL_NUMBER
+    )["base_provenance"]
+    fake.pull_reads = 0
+    fake.commit_reads = 0
+    return base_provenance
+
+
 def publish_with(fake: FakeGitHubClient, findings: list[dict] | None = None):
     result, request, summary = publication_plan(findings)
+    base_provenance = prepared_base_provenance(fake)
     with patch.object(review_publisher, "GitHubClient", return_value=fake):
         return review_publisher.publish(
             result=result,
@@ -279,10 +447,122 @@ def publish_with(fake: FakeGitHubClient, findings: list[dict] | None = None):
             repository=REPOSITORY,
             run_id=RUN_ID,
             token="short-lived-token",
+            base_provenance=base_provenance,
         )
 
 
 class DancerPublisherTests(unittest.TestCase):
+    def test_three_layer_native_stack_retains_merged_prefix_but_proves_active_child(self):
+        fake = FakeRetainedMergedPrefixGitHubClient()
+        result, request, summary = publication_plan(base_ref=fake.parent_ref)
+        prepared = prepared_base_provenance(fake)
+
+        with patch.object(review_publisher, "GitHubClient", return_value=fake):
+            result, receipt = review_publisher.publish(
+                result=result,
+                request=request,
+                summary_request=summary,
+                repository=REPOSITORY,
+                run_id=RUN_ID,
+                token="short-lived-token",
+                base_provenance=prepared,
+            )
+
+        self.assertEqual(result["publication"]["status"], "published")
+        self.assertEqual(prepared["stack"]["size"], 2)
+        self.assertEqual(
+            [node["number"] for node in prepared["stack"]["nodes"]],
+            [204, PULL_NUMBER],
+        )
+        self.assertEqual(receipt["observed_generation"]["base_provenance"], prepared)
+        self.assertEqual(fake.post_count, 1)
+
+    def test_stacked_topology_drift_has_zero_publication_mutations(self):
+        fake = FakeStackedGitHubClient()
+        result, request, summary = publication_plan(base_ref=fake.parent_ref)
+        prepared = prepared_base_provenance(fake)
+        fake.stack_number += 1
+
+        with patch.object(review_publisher, "GitHubClient", return_value=fake):
+            result, receipt = review_publisher.publish(
+                result=result,
+                request=request,
+                summary_request=summary,
+                repository=REPOSITORY,
+                run_id=RUN_ID,
+                token="short-lived-token",
+                base_provenance=prepared,
+            )
+
+        self.assertEqual(result["publication"]["status"], "failed")
+        self.assertEqual(
+            result["publication"]["fallback_reason"], "STALE_BEFORE_PUBLICATION"
+        )
+        self.assertIsNone(receipt["review"])
+        self.assertEqual(fake.post_count, 0)
+
+    def test_descendant_changes_do_not_perturb_target_generation(self):
+        fake = FakeStackedGitHubClient()
+        fake.descendant_head_sha = "e" * 40
+        result, request, summary = publication_plan(base_ref=fake.parent_ref)
+        prepared = prepared_base_provenance(fake)
+        fake.descendant_head_sha = "f" * 40
+        fake.descendant_draft = True
+        fake.parent_draft = True
+        fake.target_draft = True
+
+        with patch.object(review_publisher, "GitHubClient", return_value=fake):
+            result, receipt = review_publisher.publish(
+                result=result,
+                request=request,
+                summary_request=summary,
+                repository=REPOSITORY,
+                run_id=RUN_ID,
+                token="short-lived-token",
+                base_provenance=prepared,
+            )
+
+        self.assertEqual(result["publication"]["status"], "published")
+        self.assertEqual(
+            [node["number"] for node in prepared["stack"]["nodes"]],
+            [204, PULL_NUMBER],
+        )
+        self.assertEqual(receipt["observed_generation"]["base_provenance"], prepared)
+        self.assertEqual(fake.post_count, 1)
+
+    def test_stacked_non_ancestry_error_has_zero_publication_mutations(self):
+        fake = FakeStackedGitHubClient()
+        result, request, summary = publication_plan(base_ref=fake.parent_ref)
+        prepared = prepared_base_provenance(fake)
+        result["verdict"] = "error"
+        result["error"] = {
+            "code": "BASE_NOT_ANCESTOR",
+            "reason": "The active stack dependency chain is not ancestral.",
+        }
+
+        with patch.object(
+            review_publisher, "GitHubClient", return_value=fake
+        ) as client_class:
+            result, receipt = review_publisher.publish(
+                result=result,
+                request=request,
+                summary_request=summary,
+                repository=REPOSITORY,
+                run_id=RUN_ID,
+                token="short-lived-token",
+                base_provenance=prepared,
+            )
+
+        client_class.assert_not_called()
+        self.assertEqual(result["publication"]["status"], "failed")
+        self.assertEqual(
+            result["publication"]["fallback_reason"], "BASE_NOT_ANCESTOR"
+        )
+        self.assertIsNone(receipt["actor"])
+        self.assertIsNone(receipt["observed_generation"])
+        self.assertIsNone(receipt["review"])
+        self.assertEqual(fake.post_count, 0)
+
     def test_non_comment_event_in_either_request_has_zero_authority(self):
         for target_name in ("request", "summary"):
             for event in ("APPROVE", "REQUEST_CHANGES"):
@@ -302,6 +582,7 @@ class DancerPublisherTests(unittest.TestCase):
                             repository=REPOSITORY,
                             run_id=RUN_ID,
                             token="short-lived-token",
+                            base_provenance=prepared_base_provenance(fake),
                         )
 
                     self.assertEqual(
@@ -322,6 +603,7 @@ class DancerPublisherTests(unittest.TestCase):
             repository=REPOSITORY,
             run_id=RUN_ID,
             token="",
+            base_provenance=prepared_base_provenance(FakeGitHubClient()),
         )
 
         self.assertEqual(result["publication"]["status"], "failed")
@@ -550,6 +832,7 @@ class DancerPublisherTests(unittest.TestCase):
     def test_identical_request_reuses_exact_review_and_comment_readback(self):
         fake = FakeGitHubClient()
         result, request, summary = publication_plan([finding()])
+        base_provenance = prepared_base_provenance(fake)
 
         with patch.object(review_publisher, "GitHubClient", return_value=fake):
             first_result, first_receipt = review_publisher.publish(
@@ -559,6 +842,7 @@ class DancerPublisherTests(unittest.TestCase):
                 repository=REPOSITORY,
                 run_id=RUN_ID,
                 token="short-lived-token",
+                base_provenance=base_provenance,
             )
             second_result, second_receipt = review_publisher.publish(
                 result=copy.deepcopy(result),
@@ -567,6 +851,7 @@ class DancerPublisherTests(unittest.TestCase):
                 repository=REPOSITORY,
                 run_id=RUN_ID,
                 token="short-lived-token",
+                base_provenance=base_provenance,
             )
 
         self.assertEqual(first_result["publication"], second_result["publication"])
@@ -577,6 +862,7 @@ class DancerPublisherTests(unittest.TestCase):
     def test_identical_request_revalidates_after_reuse_readback(self):
         fake = FakeGitHubClient()
         result, request, summary = publication_plan([finding()])
+        base_provenance = prepared_base_provenance(fake)
 
         with patch.object(review_publisher, "GitHubClient", return_value=fake):
             review_publisher.publish(
@@ -586,6 +872,7 @@ class DancerPublisherTests(unittest.TestCase):
                 repository=REPOSITORY,
                 run_id=RUN_ID,
                 token="short-lived-token",
+                base_provenance=base_provenance,
             )
             fake.change_head_at_pull_read = 4
             reused_result, reused_receipt = review_publisher.publish(
@@ -595,6 +882,7 @@ class DancerPublisherTests(unittest.TestCase):
                 repository=REPOSITORY,
                 run_id=RUN_ID,
                 token="short-lived-token",
+                base_provenance=base_provenance,
             )
 
         self.assertEqual(reused_result["publication"]["status"], "published")

@@ -7,6 +7,7 @@ import pathlib
 import re
 from typing import Any
 
+import base_provenance
 import review_publication
 import review_publisher
 import review_contract
@@ -48,6 +49,76 @@ def _expected_generation(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def publication_base_provenance(receipt: dict[str, Any]) -> dict[str, Any] | None:
+    observed = receipt.get("observed_generation")
+    provenance = (
+        observed.get("base_provenance") if isinstance(observed, dict) else None
+    )
+    return provenance if isinstance(provenance, dict) else None
+
+
+def canonical_base_provenance_is_valid(
+    value: Any,
+    *,
+    repository: str,
+    result: dict[str, Any],
+    observed: dict[str, Any],
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    repository_value = value.get("repository")
+    default = value.get("default")
+    target = value.get("target")
+    stack = value.get("stack")
+    if (
+        not isinstance(repository_value, dict)
+        or repository_value.get("name_with_owner") != repository
+        or not isinstance(default, dict)
+        or not isinstance(target, dict)
+        or target.get("number") != result.get("pull_number")
+        or target.get("head_sha") != result.get("head_sha")
+        or target.get("base_ref") != result.get("base_ref")
+        or target.get("base_sha") != result.get("base_sha")
+        or default.get("ref") != observed.get("default_branch")
+        or default.get("sha") != observed.get("default_branch_sha")
+    ):
+        return False
+    if value.get("mode") == "default":
+        stack_payload = None
+    elif value.get("mode") == "stacked" and isinstance(stack, dict):
+        nodes = stack.get("nodes")
+        if not isinstance(nodes, list) or not all(
+            isinstance(node, dict) for node in nodes
+        ):
+            return False
+        stack_payload = {
+            "number": stack.get("number"),
+            "open": stack.get("open"),
+            "base_ref": stack.get("base_ref"),
+            "expected_actor": {
+                "login": review_publisher.EXPECTED_DANCER_LOGIN,
+                "actor_id": review_publisher.EXPECTED_DANCER_ACTOR_ID,
+            },
+            "pull_requests": [{**node, "draft": False} for node in nodes],
+        }
+    else:
+        return False
+    payload = {
+        "repository": {
+            "id": repository_value.get("id"),
+            "name_with_owner": repository_value.get("name_with_owner"),
+            "default_ref": default.get("ref"),
+            "default_sha": default.get("sha"),
+        },
+        "target": target,
+        "stack": stack_payload,
+    }
+    try:
+        return base_provenance.validate_base_provenance(payload) == value
+    except (TypeError, ValueError):
+        return False
+
+
 def validate_publication_pair(
     result: Any,
     receipt: Any,
@@ -65,6 +136,26 @@ def validate_publication_pair(
     lookup = result.get("lookup_context")
     expected_generation = _expected_generation(result)
     observed_generation = receipt.get("observed_generation")
+    observed_base_provenance = publication_base_provenance(receipt)
+    has_observed_base_provenance = (
+        isinstance(observed_generation, dict)
+        and "base_provenance" in observed_generation
+    )
+    direct_base_is_current = (
+        not has_observed_base_provenance
+        and isinstance(observed_generation, dict)
+        and observed_generation.get("default_branch") == result.get("base_ref")
+        and observed_generation.get("default_branch_sha") == result.get("base_sha")
+    )
+    proven_base_is_current = (
+        observed_base_provenance is not None
+        and canonical_base_provenance_is_valid(
+            observed_base_provenance,
+            repository=repository,
+            result=result,
+            observed=observed_generation,
+        )
+    )
     review = receipt.get("review")
     head_sha = result.get("head_sha")
     base_sha = result.get("base_sha")
@@ -102,8 +193,7 @@ def validate_publication_pair(
         and observed_generation.get("head_sha") == result.get("head_sha")
         and observed_generation.get("base_ref") == result.get("base_ref")
         and observed_generation.get("base_sha") == result.get("base_sha")
-        and observed_generation.get("default_branch") == result.get("base_ref")
-        and observed_generation.get("default_branch_sha") == result.get("base_sha")
+        and (proven_base_is_current or direct_base_is_current)
         and receipt.get("actor")
         == {
             "login": review_publisher.EXPECTED_DANCER_LOGIN,

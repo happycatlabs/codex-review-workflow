@@ -31,6 +31,28 @@ def load_contract():
 
 
 contract = load_contract()
+import base_provenance  # noqa: E402
+
+
+def direct_base_provenance() -> dict:
+    return base_provenance.validate_base_provenance(
+        {
+            "repository": {
+                "id": 979193317,
+                "name_with_owner": "happycatlabs/fable",
+                "default_ref": "master",
+                "default_sha": BASE_SHA,
+            },
+            "target": {
+                "number": PULL_NUMBER,
+                "base_ref": "master",
+                "base_sha": BASE_SHA,
+                "head_ref": "codex/test-head",
+                "head_sha": HEAD_SHA,
+            },
+            "stack": None,
+        }
+    )
 
 
 def finding(
@@ -90,7 +112,7 @@ def review_input(**overrides) -> dict:
     }
 
 
-def source_context() -> dict:
+def source_context(*, base_ref: str = "master", base_sha: str = BASE_SHA) -> dict:
     entries = [
         {
             "path": "lib/example.ts",
@@ -105,8 +127,8 @@ def source_context() -> dict:
             "truncated": False,
             "pull_number": PULL_NUMBER,
             "head_sha": HEAD_SHA,
-            "base_ref": "master",
-            "base_sha": BASE_SHA,
+            "base_ref": base_ref,
+            "base_sha": base_sha,
             "files_scanned": 1,
             "bytes_scanned": len(entries[0]["content"].encode()),
             "files_included": 1,
@@ -134,7 +156,12 @@ def comment_map(*, files: dict | None = None, **overrides) -> dict:
     }
 
 
-def intent_context(*, collected_at_epoch: int | None = None) -> dict:
+def intent_context(
+    *,
+    collected_at_epoch: int | None = None,
+    base_ref: str = "master",
+    base_sha: str = BASE_SHA,
+) -> dict:
     intent = {
         "title": "Trusted lookup",
         "description": "Bounded exact-ticket intent.",
@@ -148,8 +175,8 @@ def intent_context(*, collected_at_epoch: int | None = None) -> dict:
             "truncated": False,
             "pull_number": PULL_NUMBER,
             "head_sha": HEAD_SHA,
-            "base_ref": "master",
-            "base_sha": BASE_SHA,
+            "base_ref": base_ref,
+            "base_sha": base_sha,
             "ticket_identifier": "FABLE-198",
             "team_key": "FABLE",
             "issue_updated_at": "2026-07-25T00:00:00.000Z",
@@ -165,12 +192,78 @@ def intent_context(*, collected_at_epoch: int | None = None) -> dict:
     }
 
 
-def lookup_context() -> dict:
+def lookup_context(*, base_ref: str = "master", base_sha: str = BASE_SHA) -> dict:
     return {
         "complete": True,
-        "source": source_context()["manifest"],
-        "intent": intent_context()["manifest"],
+        "source": source_context(base_ref=base_ref, base_sha=base_sha)["manifest"],
+        "intent": intent_context(base_ref=base_ref, base_sha=base_sha)["manifest"],
     }
+
+
+def stacked_base_provenance() -> dict:
+    default_sha = "9" * 40
+    parent_ref = "codex/parent"
+    parent_sha = BASE_SHA
+    return base_provenance.validate_base_provenance(
+        {
+            "repository": {
+                "id": 979193317,
+                "name_with_owner": "happycatlabs/fable",
+                "default_ref": "master",
+                "default_sha": default_sha,
+            },
+            "target": {
+                "number": PULL_NUMBER,
+                "base_ref": parent_ref,
+                "base_sha": parent_sha,
+                "head_ref": "codex/child",
+                "head_sha": HEAD_SHA,
+            },
+            "stack": {
+                "number": 269,
+                "open": True,
+                "base_ref": "master",
+                "expected_actor": {
+                    "login": "dancer-automation[bot]",
+                    "actor_id": 266699010,
+                },
+                "pull_requests": [
+                    {
+                        "number": 266,
+                        "state": "open",
+                        "merged_at": None,
+                        "draft": False,
+                        "author": {
+                            "login": "dancer-automation[bot]",
+                            "actor_id": 266699010,
+                        },
+                        "base_ref": "master",
+                        "base_sha": default_sha,
+                        "base_repository_id": 979193317,
+                        "head_ref": parent_ref,
+                        "head_sha": parent_sha,
+                        "head_repository_id": 979193317,
+                    },
+                    {
+                        "number": PULL_NUMBER,
+                        "state": "open",
+                        "merged_at": None,
+                        "draft": False,
+                        "author": {
+                            "login": "dancer-automation[bot]",
+                            "actor_id": 266699010,
+                        },
+                        "base_ref": parent_ref,
+                        "base_sha": parent_sha,
+                        "base_repository_id": 979193317,
+                        "head_ref": "codex/child",
+                        "head_sha": HEAD_SHA,
+                        "head_repository_id": 979193317,
+                    },
+                ],
+            },
+        }
+    )
 
 
 class PacketSelectionTests(unittest.TestCase):
@@ -882,6 +975,7 @@ class FinalizeTests(unittest.TestCase):
         lookup: object | None = None,
         packets: object | None = None,
         provenance: object | None = None,
+        base_provenance_payload: object | None = None,
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -891,6 +985,7 @@ class FinalizeTests(unittest.TestCase):
             coverage_path = root / "coverage.json"
             lookup_path = root / "lookup.json"
             review_input_path = root / "review-input.json"
+            base_provenance_path = root / "base-provenance.json"
             current_path = root / "current.json"
             provenance_path = root / "provenance.json"
             if model_output is not None:
@@ -913,20 +1008,28 @@ class FinalizeTests(unittest.TestCase):
             review_input_path.write_text(
                 json.dumps(review_input_payload or review_input())
             )
-            current_path.write_text(
-                json.dumps(
-                    current
-                    or {
-                        "lookup_success": True,
-                        "state": "open",
-                        "head_sha": HEAD_SHA,
-                        "base_ref": "master",
-                        "base_sha": BASE_SHA,
-                        "default_branch": "master",
-                        "default_branch_sha": BASE_SHA,
-                    }
-                )
+            prepared_base = (
+                direct_base_provenance()
+                if base_provenance_payload is None
+                else base_provenance_payload
             )
+            base_provenance_path.write_text(json.dumps(prepared_base))
+            current_payload = current or {
+                "lookup_success": True,
+                "state": "open",
+                "head_sha": HEAD_SHA,
+                "base_ref": "master",
+                "base_sha": BASE_SHA,
+                "default_branch": "master",
+                "default_branch_sha": BASE_SHA,
+            }
+            if (
+                isinstance(current_payload, dict)
+                and current_payload.get("lookup_success") is True
+                and "base_provenance" not in current_payload
+            ):
+                current_payload = {**current_payload, "base_provenance": prepared_base}
+            current_path.write_text(json.dumps(current_payload))
             if provenance is None:
                 provenance = {
                     "path": f"{contract.EXPECTED_WORKFLOW_PATH}@{WORKFLOW_SHA}",
@@ -941,6 +1044,7 @@ class FinalizeTests(unittest.TestCase):
                 coverage_path,
                 lookup_path,
                 review_input_path,
+                base_provenance_path,
                 current_path,
                 provenance_path,
                 "reviewer/v1",
@@ -964,6 +1068,78 @@ class FinalizeTests(unittest.TestCase):
         self.assertEqual(result["findings"], [])
         self.assertEqual(result["publication"]["status"], "pending")
         self.assertEqual(comment, clean_model()["comment_body"])
+
+    def test_stacked_child_accepts_exact_sealed_base_provenance(self):
+        provenance = stacked_base_provenance()
+        result, _ = self.finalize(
+            clean_model(),
+            review_input_payload=review_input(base_ref="codex/parent"),
+            lookup=lookup_context(base_ref="codex/parent"),
+            base_provenance_payload=provenance,
+            current={
+                "lookup_success": True,
+                "state": "open",
+                "head_sha": HEAD_SHA,
+                "base_ref": "codex/parent",
+                "base_sha": BASE_SHA,
+                "default_branch": "master",
+                "default_branch_sha": "9" * 40,
+                "base_provenance": provenance,
+            },
+        )
+
+        self.assertEqual(result["verdict"], "clean")
+        self.assertEqual(result["base_ref"], "codex/parent")
+        self.assertEqual(result["base_sha"], BASE_SHA)
+
+    def test_stacked_topology_drift_fails_before_publication(self):
+        prepared = stacked_base_provenance()
+        changed = json.loads(json.dumps(prepared))
+        changed["stack"]["number"] += 1
+        result, _ = self.finalize(
+            clean_model(),
+            review_input_payload=review_input(base_ref="codex/parent"),
+            lookup=lookup_context(base_ref="codex/parent"),
+            base_provenance_payload=prepared,
+            current={
+                "lookup_success": True,
+                "state": "open",
+                "head_sha": HEAD_SHA,
+                "base_ref": "codex/parent",
+                "base_sha": BASE_SHA,
+                "default_branch": "master",
+                "default_branch_sha": "9" * 40,
+                "base_provenance": changed,
+            },
+        )
+
+        self.assertEqual(result["verdict"], "error")
+        self.assertEqual(result["error"]["code"], "BASE_PROVENANCE_DRIFT")
+
+    def test_stacked_chain_non_ancestry_is_a_prepublication_error(self):
+        provenance = stacked_base_provenance()
+        result, _ = self.finalize(
+            None,
+            execution={"status": "error", "code": "BASE_NOT_ANCESTOR"},
+            review_input_payload=review_input(base_ref="codex/parent"),
+            lookup=lookup_context(base_ref="codex/parent"),
+            base_provenance_payload=provenance,
+            current={
+                "lookup_success": True,
+                "state": "open",
+                "head_sha": HEAD_SHA,
+                "base_ref": "codex/parent",
+                "base_sha": BASE_SHA,
+                "default_branch": "master",
+                "default_branch_sha": "9" * 40,
+                "base_provenance": provenance,
+            },
+        )
+
+        self.assertEqual(result["verdict"], "error")
+        self.assertEqual(result["error"]["code"], "BASE_NOT_ANCESTOR")
+        self.assertEqual(result["publication"]["status"], "pending")
+        self.assertEqual(result["findings"], [])
 
     def test_any_finding_is_non_clean_and_fingerprints_ignore_classification(self):
         payload = {
