@@ -184,7 +184,11 @@ the response, and reads the exact resolved thread back before rechecking the
 generation. GitHub exposes `resolvedBy` only as the `User` GraphQL type, so it
 is informational and cannot prove the Dancer Bot. Authorship instead comes
 from the freshly verified, repository-scoped Dancer token immediately before
-the one-shot mutation. Keeps cause no mutation.
+the one-shot mutation. GitHub rejects `resolveReviewThread` for an App token
+limited to `contents: read` even when `viewerCanResolve` is true. The resolver
+token therefore requests `contents: write` with `pull-requests: write`, and is
+minted only when a resolve decision exists; the independent publisher token
+remains limited to `contents: read`. Keeps cause no mutation.
 
 Resolution writes only a separate `codex-review-resolution/v1` receipt. Every
 resolution step is non-gating: failure cannot alter the v3 result, publication,
