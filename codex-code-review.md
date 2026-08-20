@@ -290,7 +290,7 @@ Artifact: `codex-review-result/codex-review-result.json`
   "non_blocking_count": 0,
   "finding_fingerprints": ["64-character stable SHA-256"],
   "workflow_revision": "GitHub-reported reusable-workflow SHA",
-  "reviewer_revision": "codex-action@SHA;codex-cli@VERSION;model@MODEL",
+  "reviewer_revision": "codex-action@SHA;codex-cli@VERSION;model@MODEL;effort@EFFORT",
   "error": null,
   "publication": {
     "status": "published | failed",

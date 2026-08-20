@@ -208,6 +208,26 @@ class WorkflowSecurityTests(unittest.TestCase):
         for forbidden in ("actions/checkout", "run: bun", "run: npm", "repo-checkout"):
             self.assertNotIn(forbidden, review)
 
+    def test_model_and_reasoning_effort_are_explicit(self):
+        header = self.workflow.split("jobs:\n", 1)[0]
+        review = self.job("review", "publish")
+        resolution = self.job("resolution-review", "resolution-apply")
+        publish = self.job("publish", "resolution-prepare")
+
+        self.assertIn("default: gpt-5.6-sol", header)
+        self.assertIn("default: none", header)
+        for model_job in (review, resolution):
+            self.assertIn("model: ${{ inputs.model }}", model_job)
+            self.assertIn("effort: ${{ inputs.effort }}", model_job)
+        self.assertIn(
+            "model@${{ inputs.model }};effort@${{ inputs.effort }}", publish
+        )
+
+        docs = README.read_text() + ARCHITECTURE.read_text()
+        self.assertIn("| `model` | `gpt-5.6-sol` |", docs)
+        self.assertIn("| `effort` | `none` |", docs)
+        self.assertIn("model@MODEL;effort@EFFORT", docs)
+
     def test_source_and_prompt_contracts_are_bounded_and_fail_closed(self):
         contract = CONTRACT.read_text()
         source = SOURCE.read_text()

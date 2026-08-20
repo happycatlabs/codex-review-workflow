@@ -99,7 +99,8 @@ human token.
 
 | Input | Default | Purpose |
 |---|---|---|
-| `model` | `gpt-5.5` | Codex model. |
+| `model` | `gpt-5.6-sol` | Codex model. |
+| `effort` | `none` | Explicit Codex reasoning effort for review and resolution. |
 | `codex-cli-version` | `0.144.1` | Codex CLI version installed by the pinned action. |
 | `allow-users` | empty | Additional exact user actors accepted by codex-action. |
 | `allow-bot-users` | empty | Additional exact bot actors accepted by codex-action. Wildcards are not allowed. |
