@@ -883,7 +883,9 @@ def combine_review_shards(
             continue
         if execution.get("status") != "success":
             code = execution.get("code")
-            if code in ZERO_MODEL_STOP_CODES:
+            if execution.get("status") != "error":
+                failure_codes.append("REVIEW_FAILED")
+            elif code in ZERO_MODEL_STOP_CODES:
                 if all(
                     execution.get(key) == value
                     and type(execution.get(key)) is type(value)

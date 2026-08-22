@@ -881,6 +881,7 @@ class ReviewShardTests(unittest.TestCase):
             json.loads(execution_output.read_text()),
             {"status": "error", "code": "REVIEW_FAILED"},
         )
+
         self.assertIn(
             "review was incomplete",
             json.loads(model_output.read_text())["comment_body"],
@@ -983,6 +984,33 @@ class ReviewShardTests(unittest.TestCase):
         first = executions / manifest["shards"][0]["id"] / "review-execution.json"
         payload = json.loads(first.read_text())
         del payload["billing_mode"]
+        first.write_text(json.dumps(payload))
+        contract.combine_review_shards(
+            manifest_path, executions, model_output, execution_output
+        )
+        self.assertEqual(
+            json.loads(execution_output.read_text()),
+            {"status": "error", "code": "REVIEW_FAILED"},
+        )
+
+        for invalid_status in ("pending", "complete", False, 0, None):
+            write_receipts("AUTH_SUBSCRIPTION_UNAVAILABLE")
+            first = executions / manifest["shards"][0]["id"] / "review-execution.json"
+            payload = json.loads(first.read_text())
+            payload["status"] = invalid_status
+            first.write_text(json.dumps(payload))
+            contract.combine_review_shards(
+                manifest_path, executions, model_output, execution_output
+            )
+            self.assertEqual(
+                json.loads(execution_output.read_text()),
+                {"status": "error", "code": "REVIEW_FAILED"},
+            )
+
+        write_receipts("AUTH_SUBSCRIPTION_UNAVAILABLE")
+        first = executions / manifest["shards"][0]["id"] / "review-execution.json"
+        payload = json.loads(first.read_text())
+        del payload["status"]
         first.write_text(json.dumps(payload))
         contract.combine_review_shards(
             manifest_path, executions, model_output, execution_output
