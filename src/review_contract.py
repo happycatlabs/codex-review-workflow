@@ -77,9 +77,12 @@ COVERAGE_KEYS = {
     "intent_context_bytes",
 }
 ERROR_REASONS = {
-    "AUTH_MISSING": "Configure OPENAI_API_KEY for this repository.",
+    "AUTH_MISSING": "Supported ChatGPT-managed Codex auth is unavailable.",
+    "AUTH_SUBSCRIPTION_UNAVAILABLE": (
+        "This runner has no supported ChatGPT-managed Codex auth path."
+    ),
     "AUTH_LEGACY_UNSAFE": (
-        "CODEX_AUTH_JSON is not safe stateless CI auth; configure OPENAI_API_KEY."
+        "CODEX_AUTH_JSON is not accepted as stateless CI auth."
     ),
     "PREPARE_FAILED": "The bounded review input could not be prepared.",
     "SOURCE_CONTEXT_FAILED": "The bounded exact-head source context failed.",
@@ -930,7 +933,19 @@ def combine_review_shards(
             if len(unique_failure_codes) == 1
             else "REVIEW_FAILED"
         )
-        write_execution_error(execution_path, selected_code)
+        zero_model_call = (
+            not model_summaries
+            and len(failure_codes) == manifest["shard_count"]
+            and unique_failure_codes
+            <= {
+                "AUTH_MISSING",
+                "AUTH_LEGACY_UNSAFE",
+                "AUTH_SUBSCRIPTION_UNAVAILABLE",
+            }
+        )
+        write_execution_error(
+            execution_path, selected_code, zero_model_call=zero_model_call
+        )
     else:
         execution_path.write_text('{"status":"success"}\n', encoding="utf-8")
 
@@ -1441,11 +1456,21 @@ def command_check_ancestry(args: argparse.Namespace) -> None:
     raise ValueError("BASE_NOT_ANCESTOR")
 
 
-def write_execution_error(path: pathlib.Path, code: str) -> None:
+def write_execution_error(
+    path: pathlib.Path, code: str, *, zero_model_call: bool = False
+) -> None:
+    receipt: dict[str, Any] = {"status": "error", "code": code}
+    if zero_model_call:
+        receipt.update(
+            {
+                "auth_mode": "chatgpt_subscription",
+                "auth_status": "unsupported_in_github_actions",
+                "billing_mode": "none",
+                "model_invocations": 0,
+            }
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"status": "error", "code": code}) + "\n", encoding="utf-8"
-    )
+    path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
 
 
 def prompt_preparation_error_code(error: Exception) -> str:

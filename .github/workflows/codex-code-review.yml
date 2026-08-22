@@ -4,10 +4,11 @@ name: Codex Code Review (reusable)
 # 1. guard verifies a base-controlled pull_request_target and exact base provenance;
 # 2. prepare performs bounded exact-head source reads through trusted code;
 # 3. intent resolves one owner-bound ticket with protected read credentials;
-# 4. review receives only a generated prompt and no tools or credentials;
+# 4. review records a zero-model-call auth receipt until supported
+#    ChatGPT-managed subscription auth is available;
 # 5. publish refetches exact PR/base state and emits the machine result.
 # 6. resolution-prepare proves bounded single-root Dancer thread provenance;
-# 7. resolution-review decides proven candidates without GitHub authority;
+# 7. resolution-review records the same zero-model-call auth boundary;
 # 8. resolution-apply revalidates and writes only a separate non-gating receipt.
 
 on:
@@ -24,17 +25,17 @@ on:
         required: false
         default: none
       codex-cli-version:
-        description: 'Pinned @openai/codex version used by codex-action.'
+        description: 'Reserved pinned Codex CLI version for a supported producer.'
         type: string
         required: false
         default: '0.144.1'
       allow-users:
-        description: 'Additional trusted GitHub users accepted by codex-action.'
+        description: 'Reserved trusted GitHub users for a supported producer.'
         type: string
         required: false
         default: ''
       allow-bot-users:
-        description: 'Trusted bot users accepted by codex-action.'
+        description: 'Reserved trusted bot users for a supported producer.'
         type: string
         required: false
         default: ''
@@ -43,9 +44,6 @@ on:
         type: string
         required: true
     secrets:
-      OPENAI_API_KEY:
-        description: 'Supported CI credential for Codex review.'
-        required: false
       CODEX_AUTH_JSON:
         description: 'Legacy subscription credential. Detected only to fail closed.'
         required: false
@@ -498,7 +496,7 @@ jobs:
           retention-days: 3
 
   review:
-    name: Run no-tools Codex source-context review (${{ matrix.shard_id }})
+    name: Record fail-closed subscription auth (${{ matrix.shard_id }})
     needs: [trust-guard, prepare, intent]
     if: ${{ always() && needs.trust-guard.result == 'success' && needs.prepare.result == 'success' && needs.intent.result == 'success' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -517,7 +515,6 @@ jobs:
       - name: Resolve supported authentication and coverage
         id: readiness
         env:
-          HAS_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
           HAS_CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON != '' }}
         run: |
           set -euo pipefail
@@ -527,59 +524,22 @@ jobs:
           elif [ "$(jq -r '.complete' codex-review-input/metadata/coverage.json)" != true ]; then
             echo "ready=false" >> "${GITHUB_OUTPUT}"
             echo "code=INPUT_TRUNCATED" >> "${GITHUB_OUTPUT}"
-          elif [ "${HAS_OPENAI_API_KEY}" = true ]; then
-            echo "ready=true" >> "${GITHUB_OUTPUT}"
-            echo "code=" >> "${GITHUB_OUTPUT}"
           elif [ "${HAS_CODEX_AUTH_JSON}" = true ]; then
             echo "ready=false" >> "${GITHUB_OUTPUT}"
             echo "code=AUTH_LEGACY_UNSAFE" >> "${GITHUB_OUTPUT}"
           else
             echo "ready=false" >> "${GITHUB_OUTPUT}"
-            echo "code=AUTH_MISSING" >> "${GITHUB_OUTPUT}"
+            echo "code=AUTH_SUBSCRIPTION_UNAVAILABLE" >> "${GITHUB_OUTPUT}"
           fi
 
       - name: Prepare partition output directory
         run: mkdir -p codex-review-input/executions/${{ matrix.shard_id }}
-
-      - name: Create unprivileged Codex user
-        if: ${{ steps.readiness.outputs.ready == 'true' }}
-        run: |
-          set -euo pipefail
-          sudo adduser --system --home /home/codex-review --shell /bin/bash \
-            --group codex-review
-          sudo chmod 755 /home/codex-review
-          sudo usermod -a -G runner codex-review
-          sudo chown -R runner:codex-review codex-review-input
-          sudo chmod -R g+rwX codex-review-input
-          sudo find codex-review-input -type d -exec chmod g+s {} +
-
-      - name: Run Codex against generated prompt only
-        id: run-codex
-        if: ${{ steps.readiness.outputs.ready == 'true' }}
-        continue-on-error: true
-        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: codex-review-input/model-workspace/shards/${{ matrix.shard_id }}/codex-prompt.md
-          output-file: codex-review-input/executions/${{ matrix.shard_id }}/codex-output.json
-          output-schema-file: codex-review-input/model-workspace/codex-output-schema.json
-          working-directory: codex-review-input/model-workspace/shards/${{ matrix.shard_id }}
-          permission-profile: ':read-only'
-          safety-strategy: unprivileged-user
-          codex-user: codex-review
-          codex-version: ${{ inputs.codex-cli-version }}
-          codex-args: '["--ephemeral","--disable","shell_tool","--disable","unified_exec"]'
-          model: ${{ inputs.model }}
-          effort: ${{ inputs.effort }}
-          allow-users: ${{ inputs.allow-users }}
-          allow-bot-users: ${{ inputs.allow-bot-users }}
 
       - name: Record review execution
         if: ${{ always() }}
         env:
           READY: ${{ steps.readiness.outputs.ready }}
           READINESS_CODE: ${{ steps.readiness.outputs.code }}
-          REVIEW_OUTCOME: ${{ steps.run-codex.outcome }}
         run: |
           set -euo pipefail
           shard_id="${{ matrix.shard_id }}"
@@ -592,26 +552,13 @@ jobs:
             jq -n --arg code "${READINESS_CODE}" --arg shard_id "${shard_id}" \
               --arg prompt_sha256 "${prompt_sha256}" --argjson prompt_bytes "${prompt_bytes}" \
               '{status:"error",code:$code,shard_id:$shard_id,
-                prompt_sha256:$prompt_sha256,prompt_bytes:$prompt_bytes}' \
-              > "${execution_dir}/review-execution.json"
-          elif [ "${REVIEW_OUTCOME}" != success ]; then
-            jq -n --arg shard_id "${shard_id}" --arg prompt_sha256 "${prompt_sha256}" \
-              --argjson prompt_bytes "${prompt_bytes}" \
-              '{status:"error",code:"REVIEW_FAILED",shard_id:$shard_id,
-                prompt_sha256:$prompt_sha256,prompt_bytes:$prompt_bytes}' \
-              > "${execution_dir}/review-execution.json"
-          elif [ ! -s "${execution_dir}/codex-output.json" ]; then
-            jq -n --arg shard_id "${shard_id}" --arg prompt_sha256 "${prompt_sha256}" \
-              --argjson prompt_bytes "${prompt_bytes}" \
-              '{status:"error",code:"MODEL_OUTPUT_MISSING",shard_id:$shard_id,
-                prompt_sha256:$prompt_sha256,prompt_bytes:$prompt_bytes}' \
+                prompt_sha256:$prompt_sha256,prompt_bytes:$prompt_bytes,
+                auth_mode:"chatgpt_subscription",auth_status:"unsupported_in_github_actions",
+                billing_mode:"none",model_invocations:0}' \
               > "${execution_dir}/review-execution.json"
           else
-            jq -n --arg shard_id "${shard_id}" --arg prompt_sha256 "${prompt_sha256}" \
-              --argjson prompt_bytes "${prompt_bytes}" \
-              '{status:"success",shard_id:$shard_id,
-                prompt_sha256:$prompt_sha256,prompt_bytes:$prompt_bytes}' \
-              > "${execution_dir}/review-execution.json"
+            echo "A model-ready auth path is not implemented." >&2
+            exit 1
           fi
 
       - name: Upload raw review execution
@@ -829,7 +776,7 @@ jobs:
 
       - name: Finalize machine result
         env:
-          REVIEWER_REVISION: codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56;codex-cli@${{ inputs.codex-cli-version }};model@${{ inputs.model }};effort@${{ inputs.effort }}
+          REVIEWER_REVISION: subscription-auth-stop/v1;model@${{ inputs.model }};effort@${{ inputs.effort }}
         run: |
           set -euo pipefail
           helper=trusted-workflow/src/review_contract.py
@@ -1151,7 +1098,7 @@ jobs:
           retention-days: 3
 
   resolution-review:
-    name: Decide proven unresolved threads without tools
+    name: Record fail-closed resolution auth
     needs: resolution-prepare
     if: ${{ needs.resolution-prepare.outputs.ready == 'true' && fromJSON(needs.resolution-prepare.outputs.model_candidate_count) > 0 }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -1166,57 +1113,14 @@ jobs:
           name: codex-review-resolution-input
           path: codex-review-resolution-input
 
-      - name: Create unprivileged Codex user
-        continue-on-error: true
+      - name: Record zero-model-call resolution outcome
         run: |
           set -euo pipefail
-          sudo adduser --system --home /home/codex-resolution --shell /bin/bash \
-            --group codex-resolution
-          sudo chmod 755 /home/codex-resolution
-          sudo usermod -a -G runner codex-resolution
           mkdir -p codex-review-resolution-output
-          sudo chown -R runner:codex-resolution codex-review-resolution-input
-          sudo chown -R runner:codex-resolution codex-review-resolution-output
-          sudo chmod -R g+rwX codex-review-resolution-input
-          sudo chmod -R g+rwX codex-review-resolution-output
-
-      - name: Run no-tools resolution decision
-        id: run-resolution
-        continue-on-error: true
-        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: codex-review-resolution-input/model-workspace/codex-resolution-prompt.md
-          output-file: codex-review-resolution-output/codex-output.json
-          output-schema-file: codex-review-resolution-input/model-workspace/codex-resolution-output-schema.json
-          working-directory: codex-review-resolution-input/model-workspace
-          permission-profile: ':read-only'
-          safety-strategy: unprivileged-user
-          codex-user: codex-resolution
-          codex-version: ${{ inputs.codex-cli-version }}
-          codex-args: '["--ephemeral","--disable","shell_tool","--disable","unified_exec"]'
-          model: ${{ inputs.model }}
-          effort: ${{ inputs.effort }}
-          allow-users: ${{ inputs.allow-users }}
-          allow-bot-users: ${{ inputs.allow-bot-users }}
-
-      - name: Record non-gating model outcome
-        if: ${{ always() }}
-        continue-on-error: true
-        env:
-          RESOLUTION_OUTCOME: ${{ steps.run-resolution.outcome }}
-        run: |
-          set +e
-          mkdir -p codex-review-resolution-output
-          if [ "${RESOLUTION_OUTCOME}" = success ] \
-              && [ -s codex-review-resolution-output/codex-output.json ]; then
-            printf '{"status":"success"}\n' \
-              > codex-review-resolution-output/execution.json
-          else
-            printf '{"status":"error","code":"RESOLUTION_MODEL_FAILED"}\n' \
-              > codex-review-resolution-output/execution.json
-          fi
-          exit 0
+          jq -n '{status:"error",code:"AUTH_SUBSCRIPTION_UNAVAILABLE",
+            auth_mode:"chatgpt_subscription",auth_status:"unsupported_in_github_actions",
+            billing_mode:"none",model_invocations:0}' \
+            > codex-review-resolution-output/execution.json
 
       - name: Upload isolated resolution output
         if: ${{ always() }}

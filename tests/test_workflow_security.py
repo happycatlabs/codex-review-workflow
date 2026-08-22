@@ -21,7 +21,6 @@ PUBLISHER = ROOT / "src/review_publisher.py"
 RESOLUTION = ROOT / "src/review_resolution.py"
 RESOLVER = ROOT / "src/review_resolver.py"
 BASE_PROVENANCE = ROOT / "src/base_provenance.py"
-CODEX_ACTION_SHA = "52fe01ec70a42f454c9d2ebd47598f9fd6893d56"
 APP_TOKEN_ACTION_SHA = "bcd2ba49218906704ab6c1aa796996da409d3eb1"
 EXPECTED_WORKFLOW_PATH = (
     "happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml"
@@ -115,8 +114,8 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn(
             "LINEAR_CLIENT_SECRET: ${{ secrets.LINEAR_CLIENT_SECRET }}", intent
         )
-        self.assertIn("secrets.OPENAI_API_KEY", review)
-        self.assertNotIn("OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}", review)
+        self.assertNotIn("OPENAI_API_KEY", self.workflow)
+        self.assertNotIn("openai-api-key", self.workflow)
 
     def test_stacked_base_is_never_checked_out_or_executed(self):
         prepare = self.job("prepare", "intent")
@@ -180,45 +179,32 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn('repository != "happycatlabs/fable"', intent_code)
         self.assertIn("TICKET_CONTEXT_TEAM_MISMATCH", CONTRACT.read_text())
 
-    def test_review_has_generated_prompt_only_and_no_execution_tools(self):
+    def test_review_fails_closed_without_invoking_a_model(self):
         intent = self.job("intent", "review")
         review = self.job("review", "publish")
         self.assertIn("Assert model filesystem contains generated files only", intent)
         self.assertIn('"${MODEL_WORKSPACE}/codex-output-schema.json"', intent)
         self.assertIn('"${MODEL_WORKSPACE}/shards/${shard_id}/codex-prompt.md"', intent)
-        self.assertIn(
-            "working-directory: codex-review-input/model-workspace/shards/"
-            "${{ matrix.shard_id }}",
-            review,
-        )
         self.assertIn("permissions: {}", review)
-        self.assertIn(f"uses: openai/codex-action@{CODEX_ACTION_SHA}", review)
-        self.assertIn("permission-profile: ':read-only'", review)
-        self.assertIn("Create unprivileged Codex user", review)
-        self.assertIn("sudo chmod 755 /home/codex-review", review)
-        self.assertIn("safety-strategy: unprivileged-user", review)
-        self.assertIn("codex-user: codex-review", review)
-        self.assertNotIn("safety-strategy: drop-sudo", review)
-        self.assertNotIn("codex-home:", review)
-        self.assertIn(
-            "codex-args: '[\"--ephemeral\",\"--disable\",\"shell_tool\","
-            "\"--disable\",\"unified_exec\"]'",
-            review,
-        )
+        self.assertNotIn("openai/codex-action", review)
+        self.assertNotIn("Run Codex", review)
+        self.assertNotIn("codex-output.json", review)
+        self.assertIn('auth_mode:"chatgpt_subscription"', review)
+        self.assertIn('auth_status:"unsupported_in_github_actions"', review)
+        self.assertIn('billing_mode:"none",model_invocations:0', review)
+        self.assertIn("A model-ready auth path is not implemented.", review)
         for forbidden in ("actions/checkout", "run: bun", "run: npm", "repo-checkout"):
             self.assertNotIn(forbidden, review)
 
     def test_model_and_reasoning_effort_are_explicit(self):
         header = self.workflow.split("jobs:\n", 1)[0]
         review = self.job("review", "publish")
-        resolution = self.job("resolution-review", "resolution-apply")
         publish = self.job("publish", "resolution-prepare")
 
         self.assertIn("default: gpt-5.6-sol", header)
         self.assertIn("default: none", header)
-        for model_job in (review, resolution):
-            self.assertIn("model: ${{ inputs.model }}", model_job)
-            self.assertIn("effort: ${{ inputs.effort }}", model_job)
+        self.assertNotIn("model: ${{ inputs.model }}", review)
+        self.assertNotIn("effort: ${{ inputs.effort }}", review)
         self.assertIn(
             "model@${{ inputs.model }};effort@${{ inputs.effort }}", publish
         )
@@ -353,7 +339,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn('"side": "RIGHT"', PUBLICATION.read_text())
         self.assertNotIn("Fingerprint:", PUBLICATION.read_text())
 
-    def test_resolution_is_non_gating_and_separates_model_from_dancer(self):
+    def test_resolution_is_non_gating_and_never_invokes_a_model(self):
         prepare = self.job("resolution-prepare", "resolution-review")
         review = self.job("resolution-review", "resolution-apply")
         apply = self.job("resolution-apply")
@@ -363,12 +349,10 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("needs: [trust-guard, publish]", prepare)
         self.assertIn("continue-on-error: true", prepare)
         self.assertIn("permissions: {}", review)
-        self.assertIn(f"uses: openai/codex-action@{CODEX_ACTION_SHA}", review)
-        self.assertIn(
-            'codex-args: \'["--ephemeral","--disable","shell_tool",'
-            '"--disable","unified_exec"]\'',
-            review,
-        )
+        self.assertNotIn("openai/codex-action", review)
+        self.assertNotIn("codex-output.json", review)
+        self.assertIn('code:"AUTH_SUBSCRIPTION_UNAVAILABLE"', review)
+        self.assertIn('billing_mode:"none",model_invocations:0', review)
         self.assertNotIn("DANCER_", review)
         self.assertNotIn("actions/checkout", review)
         self.assertNotIn("OPENAI_API_KEY", apply)

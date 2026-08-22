@@ -886,6 +886,35 @@ class ReviewShardTests(unittest.TestCase):
             json.loads(model_output.read_text())["comment_body"],
         )
 
+        for shard in manifest["shards"]:
+            shard_root = executions / shard["id"]
+            shard_root.joinpath("review-execution.json").write_text(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "code": "AUTH_SUBSCRIPTION_UNAVAILABLE",
+                        "shard_id": shard["id"],
+                        "prompt_sha256": shard["prompt_sha256"],
+                        "prompt_bytes": shard["prompt_bytes"],
+                        "model_invocations": 0,
+                    }
+                )
+            )
+        contract.combine_review_shards(
+            manifest_path, executions, model_output, execution_output
+        )
+        self.assertEqual(
+            json.loads(execution_output.read_text()),
+            {
+                "status": "error",
+                "code": "AUTH_SUBSCRIPTION_UNAVAILABLE",
+                "auth_mode": "chatgpt_subscription",
+                "auth_status": "unsupported_in_github_actions",
+                "billing_mode": "none",
+                "model_invocations": 0,
+            },
+        )
+
     def test_partition_preparation_preserves_typed_marker_failure(self):
         helper = PromptPacketTests()
         temporary, paths = helper.prompt_fixture(
@@ -1193,8 +1222,21 @@ class FinalizeTests(unittest.TestCase):
 
         self.assertEqual(result["verdict"], "error")
         self.assertEqual(result["error"]["code"], "AUTH_LEGACY_UNSAFE")
-        self.assertIn("OPENAI_API_KEY", result["error"]["reason"])
+        self.assertNotIn("OPENAI_API_KEY", result["error"]["reason"])
         self.assertIn("AUTH_LEGACY_UNSAFE", comment)
+
+        unavailable, unavailable_comment = self.finalize(
+            None,
+            execution={
+                "status": "error",
+                "code": "AUTH_SUBSCRIPTION_UNAVAILABLE",
+            },
+        )
+        self.assertEqual(
+            unavailable["error"]["code"], "AUTH_SUBSCRIPTION_UNAVAILABLE"
+        )
+        self.assertIn("ChatGPT-managed", unavailable["error"]["reason"])
+        self.assertIn("AUTH_SUBSCRIPTION_UNAVAILABLE", unavailable_comment)
 
     def test_missing_ticket_context_is_an_expected_review_skip(self):
         result, comment = self.finalize(

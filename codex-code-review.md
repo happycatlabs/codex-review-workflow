@@ -101,25 +101,21 @@ prompt hash and byte count, and never splits an individual file diff or source
 file. Each source group is reviewed against each required diff group so no
 source/diff relationship is silently skipped.
 
-### 4. No-tools Codex
+### 4. Fail-closed subscription boundary
 
-The review job has no checkout and no Linear credential. A matrix runs one
-model call per generated partition. Each model working directory contains only
-its generated prompt; the JSON output schema and eventual structured output
-remain generated workflow files. The pinned action receives:
+The review job has no checkout, Linear credential, generic OpenAI API key, or
+model action. Until a supported ChatGPT-managed subscription session is
+integrated, every prepared partition records a deterministic auth error with
+`auth_mode: "chatgpt_subscription"`,
+`auth_status: "unsupported_in_github_actions"`, `billing_mode: "none"`, and
+`model_invocations: 0`. A present `CODEX_AUTH_JSON` is observed only as a
+boolean compatibility signal and returns `AUTH_LEGACY_UNSAFE`; its contents are
+never read. Missing supported auth returns `AUTH_SUBSCRIPTION_UNAVAILABLE`.
 
-```json
-["--ephemeral", "--disable", "shell_tool", "--disable", "unified_exec"]
-```
-
-It also uses `permission-profile: :read-only` and `safety-strategy: drop-sudo`.
-The model receives no shell, process, network, credential, patch, approval,
-merge, deployment, or external-write capability and cannot request more source.
-Each output is validated independently. Trusted aggregation deduplicates exact
-finding fingerprints and emits the existing result contract only after every
-expected partition succeeds. A missing, malformed, mismatched, or failed
-partition makes the whole review an error while preserving any concrete
-findings already returned by successful partitions.
+Any future producer must preserve complete packet validation, no-tools
+execution, machine-readable output validation, and trusted aggregation. It may
+enter the model path only after sanitized before/after supported auth status is
+bound to the exact runner and generation with no API-key fallback.
 
 ### 5. Trusted publish
 
@@ -184,15 +180,14 @@ provenance; outdated state alone never authorizes resolution. Human replies,
 legacy-position-only threads, missing/expired artifacts, and ambiguous matches
 remain untouched. Candidate overflow produces zero mutations.
 
-### 7. No-tools resolution decision
+### 7. Fail-closed resolution decision
 
-The resolution model receives generated candidate evidence only, with no source
-checkout, GitHub authority, or execution tools. It returns exactly one of
-`RESOLVE_ADDRESSED`, `RESOLVE_SUPERSEDED`, `KEEP_STILL_VALID`, or
-`KEEP_AMBIGUOUS` for every model candidate. If the exact prior fingerprint is
-still present in the current v3 result, trusted code deterministically selects
-`KEEP_STILL_VALID` without asking the model. The current review may contain
-other, unrelated findings.
+Resolution uses the same subscription boundary and records
+`AUTH_SUBSCRIPTION_UNAVAILABLE`, `billing_mode: "none"`, and
+`model_invocations: 0`; it cannot resolve a thread from model output. If the
+exact prior fingerprint is still present in the current v3 result, trusted code
+may still deterministically select `KEEP_STILL_VALID`. Every other candidate
+remains untouched.
 
 ### 8. Trusted non-gating resolution apply
 
@@ -290,7 +285,7 @@ Artifact: `codex-review-result/codex-review-result.json`
   "non_blocking_count": 0,
   "finding_fingerprints": ["64-character stable SHA-256"],
   "workflow_revision": "GitHub-reported reusable-workflow SHA",
-  "reviewer_revision": "codex-action@SHA;codex-cli@VERSION;model@MODEL;effort@EFFORT",
+  "reviewer_revision": "subscription-auth-stop/v1;model@MODEL;effort@EFFORT",
   "error": null,
   "publication": {
     "status": "published | failed",
@@ -335,6 +330,7 @@ Preparation and lookup failures are explicit and can never become clean:
 | `TICKET_CONTEXT_MISSING` | Exact owner/ticket context is absent. This is reported as a skipped review, not an infrastructure failure, while machine gates remain fail-closed. |
 | `TICKET_CONTEXT_STALE`, `TICKET_CONTEXT_TEAM_MISMATCH`, `TICKET_CONTEXT_TRUNCATED` | Intent is stale, outside the protected team, or incomplete. |
 | `UNTRUSTED_MARKER_COLLISION`, `INPUT_TRUNCATED`, `COVERAGE_INVALID` | Prompt boundaries or bounded coverage are unsafe. |
+| `AUTH_SUBSCRIPTION_UNAVAILABLE`, `AUTH_LEGACY_UNSAFE` | No supported ChatGPT-managed subscription path exists, or an opaque legacy auth signal was refused. Model invocation count remains zero. |
 | `MODEL_OUTPUT_MISSING`, `MODEL_OUTPUT_MALFORMED`, `MODEL_OUTPUT_INVALID`, `REVIEW_FAILED` | Review execution did not yield valid output. |
 | `PR_STATE_LOOKUP_FAILED`, `PR_STATE_INVALID`, `BASE_BRANCH_INVALID`, `BASE_REF_DRIFT`, `BASE_PROVENANCE_DRIFT`, `STALE_HEAD`, `STALE_BASE` | Current exact generation or stack topology no longer matches. |
 | `WORKFLOW_PROVENANCE_MISSING` | Immutable reusable-workflow provenance is absent. |
@@ -370,8 +366,8 @@ caller token must not be assumed to grant that access.
 
 ## Delivery proof
 
-After merging a workflow revision, the consumer must pin that full SHA and run
-disposable PRs that prove:
+After a supported subscription producer is independently reviewed and merged,
+the consumer must pin that full SHA and run disposable PRs that prove:
 
 1. exact helper checkout works from the base-controlled caller;
 2. an `@/`-aliased unchanged caller/dependency regression missed by diff-only
@@ -395,9 +391,10 @@ disposable PRs that prove:
    alone never supplies the addressed-or-superseded proof.
 
 The disposable proofs remain unmerged. Do not enable ordinary consumer reviews
-until the caller has the Dancer App secrets and both clean and inline readback
-receipts prove the exact actor. Thread resolution remains separate from review
-publication and produces only its own non-gating receipt.
+until sanitized before/after auth status, zero API-key fallback, exact
+runner/model/usage binding, and both clean and inline Dancer readback receipts
+are proven. Thread resolution remains separate from review publication and
+produces only its own non-gating receipt.
 
 Do not merge a disposable proof PR. Until the immutable pin and proof exist,
 this artifact is not merge authority.
