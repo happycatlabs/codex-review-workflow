@@ -21,6 +21,8 @@ PUBLISHER = ROOT / "src/review_publisher.py"
 RESOLUTION = ROOT / "src/review_resolution.py"
 RESOLVER = ROOT / "src/review_resolver.py"
 BASE_PROVENANCE = ROOT / "src/base_provenance.py"
+DOWNLOAD_ARTIFACT_SHA = "d3f86a106a0bac45b974a628896c90dbdf5c8093"
+UPLOAD_ARTIFACT_SHA = "ea165f8d65b6e75b540449e92b4886f43607fa02"
 APP_TOKEN_ACTION_SHA = "bcd2ba49218906704ab6c1aa796996da409d3eb1"
 EXPECTED_WORKFLOW_PATH = (
     "happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml"
@@ -196,6 +198,40 @@ class WorkflowSecurityTests(unittest.TestCase):
         for forbidden in ("actions/checkout", "run: bun", "run: npm", "repo-checkout"):
             self.assertNotIn(forbidden, review)
 
+    def test_zero_model_jobs_have_closed_actions_and_command_surfaces(self):
+        review = self.job("review", "publish")
+        resolution = self.job("resolution-review", "resolution-apply")
+        expected_uses = [
+            f"actions/download-artifact@{DOWNLOAD_ARTIFACT_SHA}",
+            f"actions/upload-artifact@{UPLOAD_ARTIFACT_SHA}",
+        ]
+        for block in (review, resolution):
+            self.assertEqual(
+                re.findall(r"^\s+uses: ([^\s#]+)", block, re.MULTILINE),
+                expected_uses,
+            )
+            for command in (
+                "bash -c",
+                "bun",
+                "codex",
+                "curl",
+                "deno",
+                "eval",
+                "gh",
+                "node",
+                "npm",
+                "npx",
+                "openai",
+                "python",
+                "sh -c",
+                "source",
+                "wget",
+            ):
+                self.assertNotRegex(
+                    block,
+                    rf"(?m)^\s+(?:sudo\s+)?{re.escape(command)}(?:\s|$)",
+                )
+
     def test_model_and_reasoning_effort_are_explicit(self):
         header = self.workflow.split("jobs:\n", 1)[0]
         review = self.job("review", "publish")
@@ -213,6 +249,9 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("| `model` | `gpt-5.6-sol` |", docs)
         self.assertIn("| `effort` | `none` |", docs)
         self.assertIn("model@MODEL;effort@EFFORT", docs)
+        self.assertIn(
+            "remove `OPENAI_API_KEY` in the same commit", docs
+        )
 
     def test_source_and_prompt_contracts_are_bounded_and_fail_closed(self):
         contract = CONTRACT.read_text()

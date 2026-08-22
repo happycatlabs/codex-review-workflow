@@ -23,7 +23,7 @@ non-gating thread-resolution jobs:
 6. collect at most 20 unresolved single-root modern Dancer threads whose exact
    review and comment identity can be rebuilt from retained v3 results and
    publication receipts;
-7. ask a second no-tools, no-GitHub Codex call only about proven candidates whose
+7. record the same zero-model-call subscription receipt for candidates whose
    prior fingerprint is absent from the current result; and
 8. mint separate Dancer authority only for resolve decisions, revalidate the
    exact generation, receipt, thread, and provenance, then apply one fixed
@@ -109,13 +109,9 @@ human token.
 | `linear-team-key` | required | Protected caller-owned team key required for the exact ticket. |
 
 Every job uses Happycat's ephemeral Blacksmith Linux runner pool
-(`blacksmith-2vcpu-ubuntu-2404`). The model job creates a fresh unprivileged
-user and uses Codex Action's `unprivileged-user` safety strategy; the default
-`drop-sudo` strategy is incompatible with Blacksmith's runner sudo setup.
-The account's empty home is traversable so the runner-owned API proxy can write
-its protected handoff file, while Codex itself remains unable to use sudo.
-Persistent or repository-controlled runners are unsupported by this security
-contract.
+(`blacksmith-2vcpu-ubuntu-2404`). The zero-call jobs create no Codex user, API
+proxy, provider process, or model action. Persistent or repository-controlled
+runners are unsupported by this security contract.
 
 ## Re-enable gate
 
@@ -123,8 +119,11 @@ Keep every caller disabled until a reviewed producer uses a supported
 ChatGPT-managed Codex subscription session, records sanitized before/after auth
 status plus runner/model/usage evidence, and retains zero API-key fallback. The
 shared workflow must land first; callers may then pin that exact revision while
-preserving their own no-API-key forwarding test. Workflow enablement, secret
-removal, default activation, deployment, and release remain separate actions.
+preserving their own no-API-key forwarding test. Because GitHub rejects an
+undeclared reusable-workflow secret before any receipt can be written, every
+caller must remove `OPENAI_API_KEY` in the same commit that updates this exact
+pin. Workflow enablement, secret removal, default activation, deployment, and
+release remain separate actions.
 
 ## Review meaning
 
@@ -141,10 +140,10 @@ The source packet is capped at 150 files and 1,250,000 total bytes, with a
 100,000-byte per-file limit. Any overflow fails closed as
 `SOURCE_CONTEXT_TRUNCATED`; the workflow never silently drops source files.
 The complete logical packet may be up to 2,000,000 bytes. When it exceeds the
-900,000-byte model-call limit, trusted code deterministically partitions the
-diff and source context, runs every required no-tools review, and combines the
-validated findings. One missing or failed partition fails the whole review;
-partitioning never turns incomplete coverage into a clean result.
+900,000-byte future model-call limit, trusted code deterministically partitions
+the diff and source context, but every partition currently records the same
+validated zero-call stop. No partition can emit `NO_ISSUES`, findings, or a
+completed-review claim without a supported producer.
 
 Any model finding produces `blocking_findings` and fails the workflow in V1.
 The artifact retains `blocking_count` and `non_blocking_count` as metadata, but

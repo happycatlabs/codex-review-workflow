@@ -117,6 +117,11 @@ execution, machine-readable output validation, and trusted aggregation. It may
 enter the model path only after sanitized before/after supported auth status is
 bound to the exact runner and generation with no API-key fallback.
 
+GitHub validates reusable-workflow inputs before a job can write a receipt.
+Because `OPENAI_API_KEY` is no longer declared, every caller must remove that
+secret in the same commit that updates its exact workflow pin. The shared
+workflow merges first; caller repins follow while workflows remain disabled.
+
 ### 5. Trusted publish
 
 Publication has no model or Linear credential. It re-runs the same trusted

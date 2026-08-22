@@ -121,6 +121,19 @@ ERROR_REASONS = {
         "GitHub did not report the expected immutable reusable-workflow provenance."
     ),
 }
+ZERO_MODEL_STOP_CODES = {
+    "AUTH_MISSING",
+    "AUTH_LEGACY_UNSAFE",
+    "AUTH_SUBSCRIPTION_UNAVAILABLE",
+    "INPUT_TRUNCATED",
+    "SOURCE_CONTEXT_STALE",
+}
+ZERO_MODEL_RECEIPT = {
+    "auth_mode": "chatgpt_subscription",
+    "auth_status": "unsupported_in_github_actions",
+    "billing_mode": "none",
+    "model_invocations": 0,
+}
 
 
 def expand_braces(pattern: str) -> list[str]:
@@ -846,6 +859,7 @@ def combine_review_shards(
 
     failure_codes: list[str] = []
     model_summaries: list[str] = []
+    validated_zero_model_stops = 0
     findings_by_fingerprint: dict[str, dict[str, Any]] = {}
     for expected_index, shard in enumerate(manifest["shards"]):
         shard_id = f"{expected_index:03d}"
@@ -869,9 +883,20 @@ def combine_review_shards(
             continue
         if execution.get("status") != "success":
             code = execution.get("code")
-            failure_codes.append(
-                code if code in ERROR_REASONS else "REVIEW_FAILED"
-            )
+            if code in ZERO_MODEL_STOP_CODES:
+                if all(
+                    execution.get(key) == value
+                    and type(execution.get(key)) is type(value)
+                    for key, value in ZERO_MODEL_RECEIPT.items()
+                ):
+                    failure_codes.append(code)
+                    validated_zero_model_stops += 1
+                else:
+                    failure_codes.append("REVIEW_FAILED")
+            else:
+                failure_codes.append(
+                    code if code in ERROR_REASONS else "REVIEW_FAILED"
+                )
             continue
         try:
             raw_output = load_json(shard_root / "codex-output.json")
@@ -924,8 +949,6 @@ def combine_review_shards(
         "comment_body": summary,
         "findings": findings,
     }
-    model_output_path.parent.mkdir(parents=True, exist_ok=True)
-    model_output_path.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8")
     if failure_codes:
         unique_failure_codes = set(failure_codes)
         selected_code = (
@@ -936,17 +959,23 @@ def combine_review_shards(
         zero_model_call = (
             not model_summaries
             and len(failure_codes) == manifest["shard_count"]
-            and unique_failure_codes
-            <= {
-                "AUTH_MISSING",
-                "AUTH_LEGACY_UNSAFE",
-                "AUTH_SUBSCRIPTION_UNAVAILABLE",
-            }
+            and validated_zero_model_stops == manifest["shard_count"]
         )
+        if zero_model_call:
+            model_output_path.unlink(missing_ok=True)
+        else:
+            model_output_path.parent.mkdir(parents=True, exist_ok=True)
+            model_output_path.write_text(
+                json.dumps(combined, indent=2) + "\n", encoding="utf-8"
+            )
         write_execution_error(
             execution_path, selected_code, zero_model_call=zero_model_call
         )
     else:
+        model_output_path.parent.mkdir(parents=True, exist_ok=True)
+        model_output_path.write_text(
+            json.dumps(combined, indent=2) + "\n", encoding="utf-8"
+        )
         execution_path.write_text('{"status":"success"}\n', encoding="utf-8")
 
 
@@ -1461,14 +1490,7 @@ def write_execution_error(
 ) -> None:
     receipt: dict[str, Any] = {"status": "error", "code": code}
     if zero_model_call:
-        receipt.update(
-            {
-                "auth_mode": "chatgpt_subscription",
-                "auth_status": "unsupported_in_github_actions",
-                "billing_mode": "none",
-                "model_invocations": 0,
-            }
-        )
+        receipt.update(ZERO_MODEL_RECEIPT)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
 

@@ -879,7 +879,7 @@ class ReviewShardTests(unittest.TestCase):
         )
         self.assertEqual(
             json.loads(execution_output.read_text()),
-            {"status": "error", "code": "AUTH_MISSING"},
+            {"status": "error", "code": "REVIEW_FAILED"},
         )
         self.assertIn(
             "review was incomplete",
@@ -896,6 +896,9 @@ class ReviewShardTests(unittest.TestCase):
                         "shard_id": shard["id"],
                         "prompt_sha256": shard["prompt_sha256"],
                         "prompt_bytes": shard["prompt_bytes"],
+                        "auth_mode": "chatgpt_subscription",
+                        "auth_status": "unsupported_in_github_actions",
+                        "billing_mode": "none",
                         "model_invocations": 0,
                     }
                 )
@@ -913,6 +916,80 @@ class ReviewShardTests(unittest.TestCase):
                 "billing_mode": "none",
                 "model_invocations": 0,
             },
+        )
+        self.assertFalse(model_output.exists())
+
+    def test_zero_model_receipts_are_complete_and_tamper_evident(self):
+        temporary, _, manifest_path, manifest = self.build_shards()
+        self.addCleanup(temporary.cleanup)
+        root = manifest_path.parent
+        executions = root / "executions"
+        model_output = root / "combined-output.json"
+        execution_output = root / "combined-execution.json"
+
+        def write_receipts(code: str) -> None:
+            for shard in manifest["shards"]:
+                shard_root = executions / shard["id"]
+                shard_root.mkdir(parents=True, exist_ok=True)
+                shard_root.joinpath("review-execution.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "code": code,
+                            "shard_id": shard["id"],
+                            "prompt_sha256": shard["prompt_sha256"],
+                            "prompt_bytes": shard["prompt_bytes"],
+                            "auth_mode": "chatgpt_subscription",
+                            "auth_status": "unsupported_in_github_actions",
+                            "billing_mode": "none",
+                            "model_invocations": 0,
+                        }
+                    )
+                )
+
+        for code in ("SOURCE_CONTEXT_STALE", "INPUT_TRUNCATED"):
+            write_receipts(code)
+            contract.combine_review_shards(
+                manifest_path, executions, model_output, execution_output
+            )
+            receipt = json.loads(execution_output.read_text())
+            self.assertEqual(receipt["code"], code)
+            self.assertEqual(receipt["auth_mode"], "chatgpt_subscription")
+            self.assertEqual(receipt["billing_mode"], "none")
+            self.assertEqual(receipt["model_invocations"], 0)
+            self.assertFalse(model_output.exists())
+
+        invalid_values = {
+            "auth_mode": "api_key",
+            "auth_status": "supported",
+            "billing_mode": "api",
+            "model_invocations": False,
+        }
+        for field, invalid in invalid_values.items():
+            write_receipts("AUTH_SUBSCRIPTION_UNAVAILABLE")
+            first = executions / manifest["shards"][0]["id"] / "review-execution.json"
+            payload = json.loads(first.read_text())
+            payload[field] = invalid
+            first.write_text(json.dumps(payload))
+            contract.combine_review_shards(
+                manifest_path, executions, model_output, execution_output
+            )
+            self.assertEqual(
+                json.loads(execution_output.read_text()),
+                {"status": "error", "code": "REVIEW_FAILED"},
+            )
+
+        write_receipts("AUTH_SUBSCRIPTION_UNAVAILABLE")
+        first = executions / manifest["shards"][0]["id"] / "review-execution.json"
+        payload = json.loads(first.read_text())
+        del payload["billing_mode"]
+        first.write_text(json.dumps(payload))
+        contract.combine_review_shards(
+            manifest_path, executions, model_output, execution_output
+        )
+        self.assertEqual(
+            json.loads(execution_output.read_text()),
+            {"status": "error", "code": "REVIEW_FAILED"},
         )
 
     def test_partition_preparation_preserves_typed_marker_failure(self):
@@ -1224,6 +1301,8 @@ class FinalizeTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "AUTH_LEGACY_UNSAFE")
         self.assertNotIn("OPENAI_API_KEY", result["error"]["reason"])
         self.assertIn("AUTH_LEGACY_UNSAFE", comment)
+        self.assertNotIn("NO_ISSUES", comment)
+        self.assertNotIn("review was incomplete", comment.lower())
 
         unavailable, unavailable_comment = self.finalize(
             None,
