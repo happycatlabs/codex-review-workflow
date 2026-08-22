@@ -14,7 +14,8 @@ non-gating thread-resolution jobs:
    `@/` dependencies, with no secrets;
 3. resolve one exact owner-bound FABLE ticket through protected read-only
    credentials, then seal the model prompt after those credentials leave scope;
-4. run Codex with no source checkout and both execution tools disabled;
+4. fail closed with a zero-model-call receipt until a supported
+   ChatGPT-managed subscription auth path is integrated;
 5. refetch the PR snapshot, verify immutable workflow provenance, derive
    commentable lines from the exact diff in trusted code, mint one repository-
    scoped Dancer installation token, and publish one verified `COMMENT` review
@@ -22,7 +23,7 @@ non-gating thread-resolution jobs:
 6. collect at most 20 unresolved single-root modern Dancer threads whose exact
    review and comment identity can be rebuilt from retained v3 results and
    publication receipts;
-7. ask a second no-tools, no-GitHub Codex call only about proven candidates whose
+7. record the same zero-model-call subscription receipt for candidates whose
    prior fingerprint is absent from the current result; and
 8. mint separate Dancer authority only for resolve decisions, revalidate the
    exact generation, receipt, thread, and provenance, then apply one fixed
@@ -51,7 +52,6 @@ jobs:
   review:
     uses: happycatlabs/codex-review-workflow/.github/workflows/codex-code-review.yml@WORKFLOW_COMMIT_SHA
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
       LINEAR_CLIENT_ID: ${{ secrets.LINEAR_CLIENT_ID }}
       LINEAR_CLIENT_SECRET: ${{ secrets.LINEAR_CLIENT_SECRET }}
@@ -76,12 +76,14 @@ token because this repository is public. If the repository becomes private,
 the checkout requires an explicit least-privilege cross-repository token with
 contents read access or a different immutable packaging mechanism.
 
-Set `OPENAI_API_KEY` plus a read-only Linear OAuth client as consumer repository
-secrets. The Linear query is fixed to the exact ticket in the trusted PR-owner
+Set the read-only Linear OAuth client fields as consumer repository secrets.
+The Linear query is fixed to the exact ticket in the trusted PR-owner
 marker and validates the protected team key; it cannot switch teams or run an
 arbitrary tracker query. `CODEX_AUTH_JSON` is a
 fail-closed compatibility signal only: when it is the only credential, the
-result is `AUTH_LEGACY_UNSAFE` and Codex does not run. Pass only these named
+result is `AUTH_LEGACY_UNSAFE` and Codex does not run. Without it, the result is
+`AUTH_SUBSCRIPTION_UNAVAILABLE`. Both paths record `model_invocations: 0` and
+`billing_mode: none`; the secret content is never read. Pass only these named
 secrets; do not use `secrets: inherit` for the credential-bearing review job.
 If Dependabot updates the immutable workflow pin, list `dependabot[bot]`
 explicitly alongside the automation actor so its update PR can be reviewed.
@@ -101,19 +103,27 @@ human token.
 |---|---|---|
 | `model` | `gpt-5.6-sol` | Codex model. |
 | `effort` | `none` | Explicit Codex reasoning effort for review and resolution. |
-| `codex-cli-version` | `0.144.1` | Codex CLI version installed by the pinned action. |
-| `allow-users` | empty | Additional exact user actors accepted by codex-action. |
-| `allow-bot-users` | empty | Additional exact bot actors accepted by codex-action. Wildcards are not allowed. |
+| `codex-cli-version` | `0.144.1` | Reserved Codex CLI pin for a supported producer. |
+| `allow-users` | empty | Reserved exact user actors for a supported producer. |
+| `allow-bot-users` | empty | Reserved exact bot actors for a supported producer. Wildcards are not allowed. |
 | `linear-team-key` | required | Protected caller-owned team key required for the exact ticket. |
 
 Every job uses Happycat's ephemeral Blacksmith Linux runner pool
-(`blacksmith-2vcpu-ubuntu-2404`). The model job creates a fresh unprivileged
-user and uses Codex Action's `unprivileged-user` safety strategy; the default
-`drop-sudo` strategy is incompatible with Blacksmith's runner sudo setup.
-The account's empty home is traversable so the runner-owned API proxy can write
-its protected handoff file, while Codex itself remains unable to use sudo.
-Persistent or repository-controlled runners are unsupported by this security
-contract.
+(`blacksmith-2vcpu-ubuntu-2404`). The zero-call jobs create no Codex user, API
+proxy, provider process, or model action. Persistent or repository-controlled
+runners are unsupported by this security contract.
+
+## Re-enable gate
+
+Keep every caller disabled until a reviewed producer uses a supported
+ChatGPT-managed Codex subscription session, records sanitized before/after auth
+status plus runner/model/usage evidence, and retains zero API-key fallback. The
+shared workflow must land first; callers may then pin that exact revision while
+preserving their own no-API-key forwarding test. Because GitHub rejects an
+undeclared reusable-workflow secret before any receipt can be written, every
+caller must remove `OPENAI_API_KEY` in the same commit that updates this exact
+pin. Workflow enablement, secret removal, default activation, deployment, and
+release remain separate actions.
 
 ## Review meaning
 
@@ -130,10 +140,10 @@ The source packet is capped at 150 files and 1,250,000 total bytes, with a
 100,000-byte per-file limit. Any overflow fails closed as
 `SOURCE_CONTEXT_TRUNCATED`; the workflow never silently drops source files.
 The complete logical packet may be up to 2,000,000 bytes. When it exceeds the
-900,000-byte model-call limit, trusted code deterministically partitions the
-diff and source context, runs every required no-tools review, and combines the
-validated findings. One missing or failed partition fails the whole review;
-partitioning never turns incomplete coverage into a clean result.
+900,000-byte future model-call limit, trusted code deterministically partitions
+the diff and source context, but every partition currently records the same
+validated zero-call stop. No partition can emit `NO_ISSUES`, findings, or a
+completed-review claim without a supported producer.
 
 Any model finding produces `blocking_findings` and fails the workflow in V1.
 The artifact retains `blocking_count` and `non_blocking_count` as metadata, but
